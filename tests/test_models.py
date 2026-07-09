@@ -193,3 +193,25 @@ def test_unified_audit_trail_across_all_three_guards():
     assert len(all_activity) == 3
     kinds = {e.to_dict()["kind"] for e in all_activity}
     assert kinds == {"retrieval", "tool_call", "model_call"}
+
+
+def test_record_usage_writes_to_the_audit_trail():
+    sink = InMemoryAuditSink()
+    policy = BudgetPolicy(
+        AllowlistModelPolicy({"m": [ModelCandidate("gpt-x")]}),
+        pricing={"gpt-x": (1.0, 2.0)},
+        limit_usd=10.0,
+    )
+    guard = ModelGuard(policy=policy, audit_sink=sink)
+    alice = Principal(id="alice")
+
+    guard.resolve(alice, "m")
+    guard.record_usage(alice, "gpt-x", prompt_tokens=100, completion_tokens=50)
+
+    entries = sink.tail(2)
+    assert entries[0].to_dict()["kind"] == "model_call"
+    usage_entry = entries[1]
+    assert usage_entry.to_dict()["kind"] == "model_usage"
+    assert usage_entry.model == "gpt-x"
+    assert usage_entry.prompt_tokens == 100
+    assert usage_entry.completion_tokens == 50

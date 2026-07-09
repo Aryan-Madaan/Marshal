@@ -50,9 +50,16 @@ def main() -> None:
     except ModelCallDenied as e:
         print(f"next call blocked: {e}")
 
-    print("\naudit trail:")
+    print("\naudit trail (mixed entry kinds — resolutions and usage reports):")
     for entry in shared_audit.tail(3):
-        print(f"  {entry.principal_id}: {entry.outcome} -> {entry.resolved_model} ({entry.reason})")
+        kind = entry.to_dict()["kind"]
+        if kind == "model_call":
+            print(f"  {entry.principal_id}: resolve {entry.outcome} -> {entry.resolved_model} ({entry.reason})")
+        elif kind == "model_usage":
+            print(
+                f"  {entry.principal_id}: usage on {entry.model} — "
+                f"{entry.prompt_tokens} prompt / {entry.completion_tokens} completion tokens"
+            )
 
 
 if __name__ == "__main__":

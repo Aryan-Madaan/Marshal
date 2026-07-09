@@ -1,7 +1,7 @@
 [project]
 name = "marshal-ai"
-version = "0.3.0"
-description = "Governance for AI systems: permission-aware retrieval, tool-call approval, and an audit trail — one library, one place to see what happened."
+version = "0.5.0"
+description = "Governance for AI systems: permission-aware retrieval, tool-call approval, model routing/budgets, and an audit trail — one library, one place to see what happened."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Aryan Madaan" }]
@@ -24,8 +24,17 @@ Homepage = "https://github.com/Aryan-Madaan/marshal"
 Issues = "https://github.com/Aryan-Madaan/marshal/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=7.0",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "openai>=1.0",
+    "anthropic>=0.30",
+]
 chroma = ["chromadb>=0.4"]
+opentelemetry = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.30"]
 
 [build-system]
 requires = ["hatchling"]

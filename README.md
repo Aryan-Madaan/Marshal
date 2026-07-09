@@ -31,9 +31,13 @@ Three governance surfaces, one shared audit trail:
   enforcement. Doesn't make the call for you — resolve, call it yourself,
   report usage back.
 
-See [`ideas.md`](./ideas.md) for what's next: one-line framework-agnostic
-integration (intercepting at the litellm/SDK layer instead of a
-per-framework adapter), and real vector-store adapters.
+Plus **one-line, framework-agnostic model governance** (`marshal_ai.integrations`)
+— patches the OpenAI/Anthropic SDK clients directly, so LangChain, LangGraph,
+CrewAI, AutoGen, Google ADK, or a raw script all get governed without
+touching that framework's own code. See below.
+
+See [`ideas.md`](./ideas.md) for what's next: real vector-store adapters,
+and a litellm proxy hook for deployments already running the LiteLLM proxy.
 
 ## Install
 
@@ -116,6 +120,40 @@ for candidate in guard.fallback_chain(alice, "default-chat-model"):
 
 Run `python examples/model_governance_example.py` for a fuller walkthrough.
 
+## Quickstart: one-line governance for a framework you didn't write
+
+```python
+import marshal_ai.integrations as marshal_integrations
+from marshal_ai import AllowlistModelPolicy, ModelCandidate, ModelGuard, Principal
+
+guard = ModelGuard(policy=AllowlistModelPolicy({"gpt-4o": [ModelCandidate("gpt-4o-mini")]}))
+marshal_integrations.enable(guard, Principal(id="service-account"))
+
+# anything below this line — including code inside LangChain, LangGraph,
+# CrewAI, AutoGen, or ADK — is now governed, with zero changes to that code:
+import openai
+openai.OpenAI().chat.completions.create(model="gpt-4o", messages=[...])
+# ^ actually calls "gpt-4o-mini"; usage auto-reported to `guard` from the
+# real response; a request for an unrouted model raises ModelCallDenied
+# *before* any network call happens.
+```
+
+Run `python examples/framework_integration_example.py` for a fuller
+walkthrough (denial path only, so it runs with no API key).
+
+Patches the OpenAI and Anthropic SDK client classes (sync + async) by
+exact method reference, resolved when `enable()` runs — not the
+framework's code, which is what makes this work underneath any framework
+built on either SDK without per-framework adapters. `disable_all()`
+restores the originals. The known cost, stated plainly: this breaks
+silently on a breaking SDK change to those exact classes/methods (it'll
+raise clearly at `enable()` time, not patch nothing silently — but it will
+need updating when that happens). This surface only covers *model*
+routing/budget, deliberately — tool-call execution happens inside each
+framework's own dispatch code at a different layer with no equivalent
+single choke point; use `ToolGuard` directly around your tool functions
+for that surface. See `ideas.md` for the reasoning.
+
 ## How it works
 
 ### Retrieval (`RetrievalGuard`)
@@ -180,13 +218,50 @@ incrementally whenever ready. Enterprise use swaps in custom
 `Policy`/`ToolPolicy`/`ModelPolicy`/`AuditSink` implementations backed by
 whatever's already running.
 
+## Seeing what happened: the dashboard question
+
+Marshal doesn't ship a web dashboard, deliberately. Two answers instead,
+for two different needs:
+
+**Right now, zero infra** — a terminal viewer over a `JSONLAuditSink` file:
+
+```bash
+python -m marshal_ai.cli tail audit.jsonl              # last 20 entries
+python -m marshal_ai.cli tail audit.jsonl --denied-only
+python -m marshal_ai.cli tail audit.jsonl --follow      # live-tail
+```
+
+**In production, plug into what you already run** — `OpenTelemetryAuditSink`
+exports every audit entry as an OTel span, so it shows up in Grafana,
+Honeycomb, Datadog, or a local Jaeger instead of a second, worse dashboard
+Marshal would otherwise have to build and maintain forever:
+
+```python
+from opentelemetry import trace
+from marshal_ai.otel import OpenTelemetryAuditSink  # needs: pip install "marshal-ai[opentelemetry]"
+
+otel_sink = OpenTelemetryAuditSink()
+RetrievalGuard(retriever=my_retriever, audit_sink=otel_sink)
+```
+
+Model-call spans use the official OpenTelemetry GenAI semantic conventions
+(`gen_ai.request.model`, `gen_ai.usage.input_tokens`/`output_tokens`) where
+they're stable enough to rely on; tool-call and retrieval spans use a
+`marshal.*` namespace, since the GenAI semconv's tool/agent conventions are
+still in Development status as of 2026 — see `marshal_ai/otel.py`'s
+docstring for the reasoning. `OpenTelemetryAuditSink` is write-only
+(`all_entries`/`tail`/`query` raise `NotImplementedError` — spans live in
+your tracing backend, not in this process).
+
 ## Status
 
-v0.3 — all three governance surfaces (retrieval, tool calls, model
-routing/budgets), one shared audit trail. Real Chroma integration for
-`RetrievalGuard` is in progress. See [`ideas.md`](./ideas.md) for what's
-next, especially the one-line, framework-agnostic integration story
-(litellm/SDK-level interception instead of per-framework adapters).
+v0.5 — all three governance surfaces (retrieval, tool calls, model
+routing/budgets), one shared audit trail, OpenTelemetry export, a local
+CLI viewer, and one-line model governance for any OpenAI/Anthropic-based
+framework via SDK patching. Real Chroma integration for `RetrievalGuard`
+is still in progress — see [`ideas.md`](./ideas.md) for that and what's
+next beyond it (a litellm proxy hook for deployments already running the
+LiteLLM proxy; framework-specific tool-call adapters).
 
 ## License
 

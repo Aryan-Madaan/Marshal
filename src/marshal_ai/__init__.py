@@ -36,6 +36,7 @@ from marshal_ai.models import (
     ModelDecision,
     ModelGuard,
     ModelPolicy,
+    ModelUsageEntry,
 )
 
 __version__ = "0.3.0"
@@ -79,4 +80,5 @@ __all__ = [
     "ModelDecision",
     "ModelGuard",
     "ModelPolicy",
+    "ModelUsageEntry",
 ]

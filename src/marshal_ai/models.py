@@ -203,6 +203,25 @@ class ModelCallEntry:
 register_entry_type("model_call", ModelCallEntry)
 
 
+@dataclass(frozen=True)
+class ModelUsageEntry:
+    """A record of actual usage reported after a real call completed —
+    separate from `ModelCallEntry` (the routing decision) since usage is
+    only known after the fact, often well after resolution happened."""
+
+    timestamp: float
+    principal_id: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": "model_usage", **asdict(self)}
+
+
+register_entry_type("model_usage", ModelUsageEntry)
+
+
 class ModelGuard:
     """Resolves logical model names through a policy, audits every
     resolution, and forwards usage reports for budget tracking — sharing
@@ -257,5 +276,16 @@ class ModelGuard:
         self, principal: Principal, model: str, prompt_tokens: int, completion_tokens: int
     ) -> None:
         """Report actual token usage after a real call completes, so
-        budget-tracking policies (e.g. `BudgetPolicy`) can update spend."""
+        budget-tracking policies (e.g. `BudgetPolicy`) can update spend —
+        and so the usage itself shows up in the audit trail, not just as
+        invisible internal policy state."""
         self._policy.record_usage(principal, model, prompt_tokens, completion_tokens)
+        self._audit_sink.write(
+            ModelUsageEntry(
+                timestamp=time.time(),
+                principal_id=principal.id,
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+        )

@@ -37,6 +37,46 @@ that name was never usable; see the README for the full explanation.
   entries together, and `JSONLAuditSink` round-trips mixed event types correctly
   via a `kind` discriminator (each event type self-registers a reconstructor —
   `audit.py` never needs to import `tools.py`/`models.py`).
+- **v0.4 — `ModelUsageEntry`.** `record_usage()` previously updated `BudgetPolicy`'s
+  internal spend tracker silently — real usage now also lands in the audit trail
+  as its own entry, not just invisible policy state.
+- **v0.4 — `OpenTelemetryAuditSink`** (`marshal_ai.otel`, optional `opentelemetry`
+  extra). The informed decision on "where's the dashboard": don't build one —
+  export spans into whatever OTel-compatible backend already exists (Grafana,
+  Honeycomb, Datadog, a local Jaeger). Model-call spans use the real, current
+  OpenTelemetry GenAI semantic conventions (`gen_ai.request.model`,
+  `gen_ai.usage.input_tokens`/`output_tokens` — verified against the spec, which
+  exited experimental for client spans in early 2026); tool-call/retrieval spans
+  use a `marshal.*` namespace since the tool/agent semconv is still Development
+  status as of 2026 — didn't guess at a convention that doesn't stably exist yet.
+  Write-only by design (spans live in the backend); tested against the real OTel
+  SDK's `InMemorySpanExporter`, not mocked.
+- **v0.4 — `marshal_ai.cli tail`.** The zero-infra half of the dashboard answer —
+  a stdlib-only terminal viewer over a `JSONLAuditSink` file (`-n`, `--principal`,
+  `--denied-only`, `--follow`). Covers "let me see it right now" without a
+  collector running anywhere; OTel export is the answer once there's a real
+  backend to point at.
+
+- **v0.5 — `marshal_ai.integrations`: one-line model governance for any
+  framework.** Patches the OpenAI and Anthropic SDK client classes directly
+  (sync + async — `Completions.create`, `AsyncCompletions.create`,
+  `Messages.create`, `AsyncMessages.create`, verified against the real classes,
+  not guessed) — `enable(guard, principal)` and every outbound call from
+  *any* framework built on either SDK (LangChain, LangGraph, CrewAI, AutoGen,
+  ADK) is governed with zero changes to that framework's code. Substitutes the
+  resolved model into the call, auto-reports usage from the real response
+  (`response.usage.prompt_tokens`/`completion_tokens` for OpenAI,
+  `.input_tokens`/`.output_tokens` for Anthropic — the field names genuinely
+  differ between providers). Went with direct SDK patching over a litellm
+  proxy hook after checking litellm's current docs: `async_pre_call_hook` is a
+  *proxy-server* feature (has documented 2026 bugs where it's bypassed for
+  some endpoints/tool calls) — most people calling `openai`/`anthropic`
+  directly aren't running that proxy, so patching the SDK clients themselves
+  reaches more of "anywhere" than a proxy-only hook would. `disable_all()`
+  restores originals; the fragility-on-SDK-changes cost is documented in the
+  module docstring, not hidden. Deliberately model-governance only — see
+  below for why this doesn't (and structurally can't, the same way) cover
+  tool-call interception.
 
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
@@ -51,27 +91,24 @@ keeping each surface's scope maximally narrow.
   is in progress; a real integration test against it is the actual proof this
   isn't a toy.
 
-- **One-line, framework-agnostic integration for `ToolGuard`/`ModelGuard`.** The
-  requirement that made the tool/model surfaces sharper: work with LangChain,
-  LangGraph, CrewAI, AutoGen, Google ADK, or a raw script, with a single line of
-  setup, not a per-framework adapter. The real unlock: nearly every framework's
-  actual LLM call funnels through one of a small number of choke points — the
-  OpenAI SDK, the Anthropic SDK, or increasingly a unifying layer like
-  **litellm**. Two integration paths, in order of leverage:
-  1. A litellm callback/proxy hook — litellm already has a callback/guardrails
-     system built for pre-call inspection-and-block, not just after-the-fact
-     logging (verify the exact API against litellm's current docs before
-     building; APIs like this move). One hook, and every framework routed
-     through litellm gets governed.
-  2. A direct SDK monkeypatch (wrap `openai`'s / `anthropic`'s client
-     `.create()`/`.messages.create()`) for frameworks calling those SDKs
-     directly — the same technique Helicone/Langfuse/OpenLLMetry use for their
-     own "add one line" story. Real, but fragile: breaks silently on SDK
-     version bumps, worth calling out rather than hiding.
+- **Framework-specific tool-call interception.** `marshal_ai.integrations`
+  covers *model* calls because there's one choke point (the SDK client) nearly
+  every framework shares. Tool-call *execution* has no equivalent: it happens
+  inside each framework's own dispatch code (LangChain's `Tool.run`, ADK's
+  callback hooks, a hand-rolled loop) after the model's response is parsed —
+  different shape per framework, not one shared choke point. This means
+  one-line tool governance genuinely needs N framework-specific adapters, not
+  one patch. Today, wrapping your tool functions in `ToolGuard` directly is
+  the real (explicit, not automatic) answer. Worth revisiting per-framework
+  once one specific framework's adoption justifies the adapter.
 
-  Target shape: `import marshal_ai; marshal_ai.enable(tool_policy=..., model_policy=...)`
-  at process startup, patching whichever client(s) are importable so the agent
-  framework on top never has to know Marshal exists.
+- **A litellm proxy hook**, for teams already running the LiteLLM proxy rather
+  than calling `openai`/`anthropic` directly — `async_pre_call_hook` on a
+  `CustomLogger` subclass, registered via `litellm_settings.callbacks`. Skipped
+  for now in favor of direct SDK patching (see "Shipped" above) since it only
+  reaches proxy deployments, and has documented 2026 bugs around certain
+  endpoints/tool calls bypassing it entirely — worth re-checking litellm's
+  docs before picking this up, this area moves.
 
 - **Estimate-before-call budget checks.** `BudgetPolicy` today only enforces on
   the *next* call once prior usage has been reported — it can't yet block a call
