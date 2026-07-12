@@ -4,6 +4,9 @@ Governance for AI systems: permission-aware retrieval, tool-call approval,
 model routing with budgets and cross-border data-residency/retention
 control, and one audit trail across all three.
 
+**[See the landing page →](https://aryan-madaan.github.io/Marshal/)** — the
+pitch, a live checkpoint demo, and the code, in two minutes.
+
 `pip install`/`import` name is `marshal_ai` (not `marshal` — that name is a
 reserved Python standard-library module, see below).
 
