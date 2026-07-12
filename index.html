@@ -1,0 +1,901 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marshal — the model call is the transfer</title>
+<meta name="description" content="Marshal is governance for AI systems: permission-aware retrieval, tool-call approval, model routing with budgets, cross-border data residency and retention control, and one audit trail across all of it — enforced in code.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 48 56%22><rect width=%2248%22 height=%2256%22 fill=%22%2315171a%22/><path d=%22M24 4 L42 11 V28 C42 40 33 47 24 51 C15 47 6 40 6 28 V11 Z%22 fill=%22none%22 stroke=%22%23c4972f%22 stroke-width=%223%22/></svg>">
+<style>
+
+  :root {
+    --paper: #15171A;
+    --paper-raised: #1D2023;
+    --paper-stamp-bed: #191C1F;
+    --ink: #EDEAE0;
+    --ink-soft: #A2A399;
+    --ink-faint: #6E7069;
+    --rule: #33352F;
+    --rule-strong: #4C4E44;
+    --brass: #C4972F;
+    --brass-bright: #E0B458;
+    --brass-dim: #8A6F2A;
+    --stamp-red: #C4463A;
+    --stamp-red-bg: rgba(196, 70, 58, 0.12);
+    --stamp-green: #3F8F5C;
+    --stamp-green-bg: rgba(63, 143, 92, 0.12);
+    --pen: #D4A94A;
+    --pen-hover: #E8C36E;
+    --code-bg: #0C0D0F;
+    --code-ink: #E4DFD3;
+    --code-comment: #6B7076;
+    --code-string: #D8B876;
+    --code-keyword: #E0937E;
+    --focus: #E0B458;
+
+    --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+
+    color-scheme: dark;
+  }
+
+  :root[data-theme="light"] {
+    --paper: #EDEAE0;
+    --paper-raised: #E1DAC5;
+    --paper-stamp-bed: #E6E0CC;
+    --ink: #17181A;
+    --ink-soft: #4C4D45;
+    --ink-faint: #77786C;
+    --rule: #D2C9AC;
+    --rule-strong: #B3A87C;
+    --brass: #8A6A1E;
+    --brass-bright: #6E5417;
+    --brass-dim: #A9863A;
+    --stamp-red: #A32C20;
+    --stamp-red-bg: rgba(163, 44, 32, 0.08);
+    --stamp-green: #2C6B45;
+    --stamp-green-bg: rgba(44, 107, 69, 0.08);
+    --pen: #7A5C18;
+    --pen-hover: #574109;
+    --code-bg: #1A1B17;
+    --code-ink: #E7E2D3;
+    --code-comment: #8C8D80;
+    --code-string: #D8B876;
+    --code-keyword: #D98D77;
+    --focus: #7A5C18;
+    color-scheme: light;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --paper: #EDEAE0;
+      --paper-raised: #E1DAC5;
+      --paper-stamp-bed: #E6E0CC;
+      --ink: #17181A;
+      --ink-soft: #4C4D45;
+      --ink-faint: #77786C;
+      --rule: #D2C9AC;
+      --rule-strong: #B3A87C;
+      --brass: #8A6A1E;
+      --brass-bright: #6E5417;
+      --brass-dim: #A9863A;
+      --stamp-red: #A32C20;
+      --stamp-red-bg: rgba(163, 44, 32, 0.08);
+      --stamp-green: #2C6B45;
+      --stamp-green-bg: rgba(44, 107, 69, 0.08);
+      --pen: #7A5C18;
+      --pen-hover: #574109;
+      --code-bg: #1A1B17;
+      --code-ink: #E7E2D3;
+      --code-comment: #8C8D80;
+      --code-string: #D8B876;
+      --code-keyword: #D98D77;
+      --focus: #7A5C18;
+      color-scheme: light;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--pen); }
+  a:hover { color: var(--pen-hover); }
+
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 3px;
+  }
+
+  .wrap {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* ---------- letterhead ---------- */
+
+  .letterhead {
+    border-bottom: 2px solid var(--rule-strong);
+    background: var(--paper-raised);
+  }
+
+  .letterhead .wrap {
+    max-width: 920px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px 20px;
+    padding-top: 18px;
+    padding-bottom: 18px;
+  }
+
+  .wordmark {
+    font-family: var(--font-mono);
+    font-size: 15px;
+    letter-spacing: 0.18em;
+    font-weight: 700;
+    text-decoration: none;
+    color: var(--ink);
+    display: flex;
+    align-items: center;
+    gap: 11px;
+  }
+
+  .wordmark .badge { color: var(--brass); flex: none; }
+
+  .letterhead nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 22px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 600;
+    justify-content: flex-end;
+  }
+
+  .letterhead nav a {
+    text-decoration: none;
+    color: var(--ink-soft);
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid transparent;
+  }
+  .letterhead nav a:hover {
+    color: var(--brass-bright);
+    border-bottom-color: var(--brass);
+  }
+
+  /* ---------- hero ---------- */
+
+  .hero {
+    position: relative;
+    padding: 72px 0 60px;
+    overflow: hidden;
+  }
+
+  .hero-badge-wash {
+    position: absolute;
+    top: -60px;
+    right: -160px;
+    width: 640px;
+    height: 720px;
+    color: var(--ink);
+    opacity: 0.05;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .hero > :not(.hero-badge-wash) { position: relative; z-index: 1; }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--brass);
+    margin: 0 0 22px;
+  }
+
+  h1.headline {
+    font-family: var(--font-display);
+    font-weight: 850;
+    font-size: clamp(3rem, 8.5vw, 5.75rem);
+    line-height: 0.98;
+    letter-spacing: -0.025em;
+    margin: 0 0 28px;
+    color: var(--ink);
+  }
+
+  .lede {
+    font-size: 19px;
+    max-width: 58ch;
+    color: var(--ink-soft);
+    margin: 0 0 40px;
+  }
+
+  .lede strong { color: var(--ink); font-weight: 700; }
+
+  /* ---------- checkpoint widget (signature element) ---------- */
+
+  .checkpoint {
+    border: 2px solid var(--rule-strong);
+    background: var(--paper-stamp-bed);
+    border-radius: 3px;
+    padding: 0;
+    margin-bottom: 36px;
+  }
+
+  .checkpoint-label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink);
+    background: var(--rule-strong);
+    margin: 0;
+    padding: 10px 22px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+
+  .checkpoint-label .tag {
+    color: var(--brass-bright);
+    background: var(--paper);
+    padding: 2px 8px;
+    border-radius: 2px;
+    letter-spacing: 0.1em;
+  }
+
+  .checkpoint-body { padding: 22px 22px 24px; }
+
+  .jurisdiction-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 22px;
+  }
+
+  .jbtn {
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    background: transparent;
+    border: 2px solid var(--rule-strong);
+    color: var(--ink);
+    padding: 8px 16px;
+    border-radius: 2px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  }
+
+  .jbtn:hover { border-color: var(--brass); color: var(--brass-bright); }
+
+  .jbtn[aria-pressed="true"] {
+    background: var(--brass);
+    color: #17181A;
+    border-color: var(--brass);
+  }
+
+  .stamp-bed {
+    position: relative;
+    border-top: 2px dashed var(--rule);
+    padding-top: 22px;
+    min-height: 92px;
+  }
+
+  .stamp-result {
+    display: none;
+    align-items: center;
+    gap: 20px;
+    opacity: 0;
+    transform: scale(1.6) rotate(-14deg);
+    transition: opacity 0.2s ease, transform 0.36s cubic-bezier(.16,1.6,.3,1);
+  }
+
+  .stamp-result.show {
+    opacity: 1;
+    transform: scale(1) rotate(-4deg);
+  }
+
+  .stamp-mark {
+    font-family: var(--font-mono);
+    font-size: 21px;
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    border: 4px solid currentColor;
+    border-radius: 4px;
+    padding: 10px 18px;
+    white-space: nowrap;
+    transform: rotate(-4deg);
+    position: relative;
+  }
+
+  .stamp-mark::before,
+  .stamp-mark::after {
+    content: "";
+    position: absolute;
+    width: 7px;
+    height: 7px;
+    border: 2px solid currentColor;
+    top: 3px;
+  }
+  .stamp-mark::before { left: 3px; border-right: none; border-bottom: none; }
+  .stamp-mark::after { right: 3px; border-left: none; border-bottom: none; }
+
+  .stamp-mark.allow { color: var(--stamp-green); background: var(--stamp-green-bg); }
+  .stamp-mark.deny { color: var(--stamp-red); background: var(--stamp-red-bg); }
+
+  .stamp-detail {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--ink-soft);
+    line-height: 1.6;
+  }
+
+  .stamp-detail .verdict-word {
+    color: var(--ink);
+    font-weight: 700;
+    display: block;
+    margin-bottom: 3px;
+  }
+
+  .stamp-detail .reason {
+    color: var(--ink-faint);
+    display: block;
+  }
+
+  .stamp-placeholder {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+    padding-top: 4px;
+    text-transform: uppercase;
+  }
+
+  .cta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    align-items: center;
+  }
+
+  .btn {
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    font-weight: 700;
+    text-decoration: none;
+    padding: 12px 20px;
+    border-radius: 2px;
+    border: 2px solid var(--ink);
+    color: var(--ink);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    letter-spacing: 0.02em;
+  }
+
+  .btn.primary {
+    background: var(--brass);
+    color: #17181A;
+    border-color: var(--brass);
+  }
+  .btn.primary:hover { background: var(--brass-bright); border-color: var(--brass-bright); }
+  .btn.ghost:hover { background: var(--paper-raised); border-color: var(--brass); color: var(--brass-bright); }
+
+  .install-code {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+
+  /* ---------- sections ---------- */
+
+  section.block {
+    padding: 54px 0;
+    border-top: 2px solid var(--rule);
+  }
+
+  h2.section-title {
+    font-family: var(--font-display);
+    font-size: 1.9rem;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    margin: 0 0 10px;
+  }
+
+  .section-kicker {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--brass);
+    margin: 0 0 12px;
+  }
+
+  .section-intro {
+    color: var(--ink-soft);
+    max-width: 62ch;
+    margin: 0 0 34px;
+  }
+
+  /* jurisdiction table */
+
+  .jtable {
+    border-top: 2px solid var(--rule-strong);
+  }
+
+  .jrow {
+    display: grid;
+    grid-template-columns: 88px 1fr;
+    gap: 20px;
+    padding: 18px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .jrow .jcode {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 800;
+    color: var(--brass-bright);
+    background: var(--paper-raised);
+    border: 1px solid var(--rule-strong);
+    border-radius: 2px;
+    padding: 4px 0;
+    text-align: center;
+    height: fit-content;
+  }
+
+  .jrow .jtest {
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .jrow .jnote {
+    color: var(--ink-soft);
+    font-size: 15.5px;
+    margin-top: 4px;
+  }
+
+  /* code block */
+
+  pre.code {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.65;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    padding: 22px 24px;
+    border-radius: 3px;
+    border-left: 4px solid var(--brass);
+    overflow-x: auto;
+    margin: 0;
+  }
+
+  pre.code .c { color: var(--code-comment); }
+  pre.code .s { color: var(--code-string); }
+  pre.code .k { color: var(--code-keyword); }
+
+  .code-caption {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-faint);
+    margin-top: 10px;
+  }
+
+  /* clauses */
+
+  .clause {
+    display: grid;
+    grid-template-columns: 84px 1fr;
+    gap: 20px;
+    padding: 24px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .clause:first-child { padding-top: 0; }
+  .clause:last-child { border-bottom: none; }
+
+  .clause .cnum {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    color: var(--brass);
+    border: 1px solid var(--rule-strong);
+    border-radius: 2px;
+    padding: 4px 6px;
+    text-align: center;
+    height: fit-content;
+  }
+
+  .clause h3 {
+    font-family: var(--font-body);
+    font-size: 17px;
+    font-weight: 800;
+    margin: 0 0 6px;
+  }
+
+  .clause p {
+    margin: 0;
+    color: var(--ink-soft);
+    font-size: 15.5px;
+  }
+
+  .clause code {
+    font-family: var(--font-mono);
+    font-size: 0.92em;
+    background: var(--paper-raised);
+    padding: 1px 5px;
+    border-radius: 2px;
+  }
+
+  /* footer */
+
+  footer {
+    border-top: 2px solid var(--rule-strong);
+    background: var(--paper-raised);
+    padding: 36px 0 52px;
+  }
+
+  footer .wrap {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 20px;
+    align-items: flex-start;
+  }
+
+  footer .foot-note {
+    font-size: 13.5px;
+    color: var(--ink-faint);
+    max-width: 46ch;
+  }
+
+  footer .foot-links {
+    display: flex;
+    gap: 18px;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 13px;
+  }
+
+  footer .foot-links a { text-decoration: none; }
+  footer .foot-links a:hover { color: var(--brass-bright); }
+
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    background: transparent;
+    border: 1px solid var(--rule-strong);
+    color: var(--ink-soft);
+    border-radius: 2px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .theme-toggle:hover { border-color: var(--brass); color: var(--brass-bright); }
+  .theme-toggle svg { width: 16px; height: 16px; display: block; }
+  .theme-toggle .icon-moon { display: none; }
+  :root[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+  :root[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) .theme-toggle .icon-sun { display: none; }
+    :root:not([data-theme="dark"]) .theme-toggle .icon-moon { display: block; }
+  }
+
+  @media (max-width: 620px) {
+    .jrow, .clause { grid-template-columns: 1fr; }
+    .jrow .jcode, .clause .cnum { width: fit-content; padding: 3px 10px; }
+    .hero { padding-top: 48px; }
+    .hero-badge-wash { display: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .stamp-result { transition: opacity 0.01s linear; transform: none !important; }
+  }
+
+</style>
+</head>
+<body>
+
+<header class="letterhead">
+  <div class="wrap">
+    <a class="wordmark" href="#top">
+      <svg class="badge" width="20" height="23" viewBox="0 0 48 56" fill="none" aria-hidden="true">
+        <path d="M24 4 L42 11 V28 C42 40 33 47 24 51 C15 47 6 40 6 28 V11 Z" stroke="currentColor" stroke-width="3.5"/>
+        <path d="M24 14 V44" stroke="currentColor" stroke-width="1.5" opacity="0.55"/>
+      </svg>
+      MARSHAL
+    </a>
+    <nav>
+      <a href="#checkpoint">the checkpoint</a>
+      <a href="#code">the code</a>
+      <a href="https://github.com/Aryan-Madaan/Marshal" target="_blank" rel="noopener">github ↗</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+  <section class="hero wrap">
+    <svg class="hero-badge-wash" viewBox="0 0 48 56" fill="none" aria-hidden="true">
+      <path d="M24 4 L42 11 V28 C42 40 33 47 24 51 C15 47 6 40 6 28 V11 Z" stroke="currentColor" stroke-width="1.4"/>
+      <path d="M24 14 V44" stroke="currentColor" stroke-width="0.7"/>
+    </svg>
+    <p class="eyebrow">Governance for AI systems · enforced in code</p>
+    <h1 class="headline">The model call<br>is the transfer.</h1>
+    <p class="lede">
+      An agent calling a foreign-hosted model is a cross-border transfer of
+      whatever data is in that prompt. <strong>GDPR, the UK GDPR, Thailand's
+      PDPA, Singapore's PDPA, and India's DPDP Act each apply a genuinely
+      different legal test to that same act</strong> — and most model-routing
+      code has no idea any of them exist. Marshal does, and it holds the line.
+    </p>
+
+    <div class="checkpoint" id="checkpoint">
+      <p class="checkpoint-label">
+        <span>The checkpoint</span>
+        <span class="tag">live</span>
+      </p>
+      <div class="checkpoint-body">
+        <p class="stamp-placeholder" style="margin:0 0 14px; padding-top:0;">Declare the jurisdiction this call's data is governed from —</p>
+        <div class="jurisdiction-row" role="group" aria-label="Choose a jurisdiction">
+          <button class="jbtn" data-j="EU" aria-pressed="false">EU</button>
+          <button class="jbtn" data-j="IN" aria-pressed="false">IN</button>
+          <button class="jbtn" data-j="TH" aria-pressed="false">TH</button>
+          <button class="jbtn" data-j="SG" aria-pressed="false">SG</button>
+        </div>
+        <div class="stamp-bed">
+          <p class="stamp-placeholder" id="stamp-placeholder">— awaiting declaration —</p>
+          <div class="stamp-result" id="stamp-result" aria-live="polite">
+            <span class="stamp-mark" id="stamp-mark"></span>
+            <span class="stamp-detail" id="stamp-detail"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/Aryan-Madaan/Marshal" target="_blank" rel="noopener">Read the code on GitHub</a>
+      <a class="btn ghost" href="https://aryanmadaan.vercel.app/blog/cross-border-data-transfer" target="_blank" rel="noopener">Read the full argument</a>
+      <span class="install-code">pip install marshal-ai</span>
+    </div>
+  </section>
+
+  <section class="block wrap" id="jurisdictions">
+    <p class="section-kicker">Why one routing rule can't cover this</p>
+    <h2 class="section-title">Five jurisdictions. Five different tests for the same act.</h2>
+    <p class="section-intro">
+      Not five strictness levels of one rule — five structurally different
+      mechanisms. A compliance answer built for one doesn't transfer to the
+      next by analogy.
+    </p>
+    <div class="jtable">
+      <div class="jrow">
+        <div class="jcode">EU</div>
+        <div>
+          <div class="jtest">Prohibition, with enumerated exceptions</div>
+          <div class="jnote">GDPR Chapter V bans a transfer by default unless an adequacy decision, a Standard Contractual Clause, or a Binding Corporate Rule applies. No exception, no transfer.</div>
+        </div>
+      </div>
+      <div class="jrow">
+        <div class="jcode">UK</div>
+        <div>
+          <div class="jtest">Same shape, relaxed bar</div>
+          <div class="jnote">A destination only has to be "not materially lower" than the UK's own standard, not a structural match — the 2026 ICO guidance's own words.</div>
+        </div>
+      </div>
+      <div class="jrow">
+        <div class="jcode">TH</div>
+        <div>
+          <div class="jtest">A whitelist with nothing on it yet</div>
+          <div class="jnote">Thailand's PDPA permits transfer to an "adequate" country — except no adequacy list has been published, so every transfer needs its own signed contract instead.</div>
+        </div>
+      </div>
+      <div class="jrow">
+        <div class="jcode">SG</div>
+        <div>
+          <div class="jtest">A standards test, not a country test</div>
+          <div class="jnote">Singapore's PDPA asks whether the specific recipient provides "comparable" protection — the same destination country can pass for one recipient and fail for another.</div>
+        </div>
+      </div>
+      <div class="jrow">
+        <div class="jcode">IN</div>
+        <div>
+          <div class="jtest">Permission, with a blacklist underneath</div>
+          <div class="jnote">India's DPDP Act permits transfer everywhere except a notified restricted list — currently empty — but sectoral rules (RBI, SEBI, IRDAI) still bind underneath it.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block wrap" id="code">
+    <p class="section-kicker">A real, fail-closed answer</p>
+    <h2 class="section-title">Two composable policies. No exceptions granted quietly.</h2>
+    <p class="section-intro">
+      <code>ResidencyPolicy</code> answers <em>where</em> — and records the
+      transfer mechanism, not just the outcome. <code>RetentionPolicy</code>
+      answers <em>how long</em>, zero-data-retention included. Both wrap any
+      <code>ModelPolicy</code>, both fail closed on missing context, neither
+      ever falls through to a silent default deployment.
+    </p>
+    <pre class="code"><span class="c"># jurisdiction -&gt; {deployment: transfer mechanism}</span>
+policy = ResidencyPolicy(
+    AllowlistModelPolicy(routes),
+    allowed_by_jurisdiction={
+        <span class="s">"EU"</span>: {<span class="s">"eu-deployment"</span>: <span class="s">"adequacy_decision"</span>},
+        <span class="s">"IN"</span>: {<span class="s">"in-deployment"</span>: <span class="s">"dpdp_section_16"</span>},
+    },
+)
+policy = RetentionPolicy(policy, deployment_retention_days={<span class="s">"eu-deployment"</span>: 0})
+guard = ModelGuard(policy=policy)
+
+model = guard.resolve(alice, <span class="s">"default-chat-model"</span>, context={<span class="s">"jurisdiction"</span>: <span class="s">"EU"</span>})
+<span class="c"># -&gt; "eu-deployment", audited as:</span>
+<span class="c"># "resolved 'default-chat-model' -&gt; 'eu-deployment' for jurisdiction</span>
+<span class="c">#  'EU' via 'adequacy_decision'"</span>
+
+guard.resolve(alice, <span class="s">"default-chat-model"</span>, context={<span class="s">"jurisdiction"</span>: <span class="s">"TH"</span>})
+<span class="c"># -&gt; raises ModelCallDenied. Fails closed — no silent fall-through.</span></pre>
+    <p class="code-caption">verbatim from README.md / examples/residency_example.py</p>
+  </section>
+
+  <section class="block wrap" id="library">
+    <p class="section-kicker">One library, one audit trail</p>
+    <h2 class="section-title">What else Marshal already enforces.</h2>
+    <div class="clauses">
+      <div class="clause">
+        <div class="cnum">ART. I</div>
+        <div>
+          <h3>Retrieval — <code>RetrievalGuard</code></h3>
+          <p>Document/field-level access control on any retriever, with redaction built in — an ACL decision and a content-sensitivity decision are different questions, and Marshal answers both.</p>
+        </div>
+      </div>
+      <div class="clause">
+        <div class="cnum">ART. II</div>
+        <div>
+          <h3>Tool calls — <code>ToolGuard</code></h3>
+          <p>Risk-tiered allow/deny/require-approval on every tool call, with argument redaction. A denied or declined call raises loudly — never a silent no-op.</p>
+        </div>
+      </div>
+      <div class="clause">
+        <div class="cnum">ART. III</div>
+        <div>
+          <h3>Model routing — <code>ModelGuard</code></h3>
+          <p>Resolves a logical model name per principal, with governed fallback chains, per-principal budgets, and now jurisdiction and retention as first-class routing inputs.</p>
+        </div>
+      </div>
+      <div class="clause">
+        <div class="cnum">ART. IV</div>
+        <div>
+          <h3>Content — <code>marshal_ai.sensitive</code></h3>
+          <p>Deterministic, regex-based secret/PII detection across every surface — not "is this allowed" but "does the payload itself contain something that shouldn't be here." Findings are recorded as counts, never the matched text.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p class="foot-note">
+      Marshal is MIT-licensed, has zero required dependencies, and is not
+      yet published to PyPI — clone the repo and install locally.
+      Every decision here is enforced deterministically; none of it is
+      legal advice.
+    </p>
+    <div class="foot-links">
+      <a href="https://github.com/Aryan-Madaan/Marshal" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://aryanmadaan.vercel.app/blog/cross-border-data-transfer" target="_blank" rel="noopener">The argument</a>
+      <a href="https://aryanmadaan.vercel.app" target="_blank" rel="noopener">Aryan Madaan</a>
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle dark/light theme">
+        <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2"/>
+          <path d="M12 2.5v2.6M12 18.9v2.6M4.6 4.6l1.9 1.9M17.5 17.5l1.9 1.9M2.5 12h2.6M18.9 12h2.6M4.6 19.4l1.9-1.9M17.5 6.5l1.9-1.9"/>
+        </svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.8 6.8 0 0 0 10.5 10.5Z"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  // Mirrors the real, tested ResidencyPolicy config in
+  // examples/residency_example.py — not a fabricated demo.
+  var OUTCOMES = {
+    EU: {
+      allow: true,
+      model: "eu-deployment",
+      reason: "for jurisdiction 'EU' via 'adequacy_decision'"
+    },
+    IN: {
+      allow: true,
+      model: "in-deployment",
+      reason: "for jurisdiction 'IN' via 'dpdp_section_16'"
+    },
+    TH: {
+      allow: false,
+      model: null,
+      reason: "no jurisdiction-compliant deployment for 'TH' among candidates"
+    },
+    SG: {
+      allow: false,
+      model: null,
+      reason: "no jurisdiction-compliant deployment for 'SG' among candidates"
+    }
+  };
+
+  var buttons = document.querySelectorAll(".jbtn");
+  var placeholder = document.getElementById("stamp-placeholder");
+  var result = document.getElementById("stamp-result");
+  var mark = document.getElementById("stamp-mark");
+  var detail = document.getElementById("stamp-detail");
+
+  buttons.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      buttons.forEach(function (b) { b.setAttribute("aria-pressed", "false"); });
+      btn.setAttribute("aria-pressed", "true");
+
+      var outcome = OUTCOMES[btn.getAttribute("data-j")];
+      placeholder.style.display = "none";
+      result.style.display = "flex";
+
+      result.classList.remove("show");
+      // force reflow so the stamp-impact transition replays every click
+      void result.offsetWidth;
+
+      mark.textContent = outcome.allow ? "ALLOWED" : "DENIED";
+      mark.className = "stamp-mark " + (outcome.allow ? "allow" : "deny");
+      detail.innerHTML =
+        '<span class="verdict-word">' + (outcome.allow ? "resolved -&gt; " + outcome.model : "ModelCallDenied") + "</span>" +
+        '<span class="reason">' + outcome.reason + "</span>";
+
+      requestAnimationFrame(function () { result.classList.add("show"); });
+    });
+  });
+
+  var toggle = document.getElementById("theme-toggle");
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem("marshal-theme"); } catch (e) {}
+  if (stored) root.setAttribute("data-theme", stored);
+
+  toggle.addEventListener("click", function () {
+    var current = root.getAttribute("data-theme") ||
+      (window.matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
+    var next = current === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("marshal-theme", next); } catch (e) {}
+  });
+})();
+</script>
+
+</body>
+</html>
