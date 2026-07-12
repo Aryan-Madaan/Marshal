@@ -264,3 +264,78 @@ def test_enable_anthropic_async_path_denies_without_calling_original(monkeypatch
         asyncio.run(client.create(model="claude-opus-4-8", max_tokens=10, messages=[]))
 
     assert calls == []
+
+
+# --- sensitive-data scanning at the SDK-patch layer -----------------------
+
+
+def test_enable_openai_with_scanner_blocks_prompt_before_any_network_call(monkeypatch):
+    from openai.resources.chat.completions.completions import Completions
+    from marshal_ai.sensitive import SensitiveDataScanner
+
+    calls = []
+    monkeypatch.setattr(
+        Completions, "create", lambda self, **kw: calls.append(kw) or None, raising=True
+    )
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("m")]}), audit_sink=sink)
+    marshal_integrations.enable_openai(guard, Principal(id="alice"), scanner=SensitiveDataScanner())
+
+    messages = [{"role": "user", "content": "here is my key AKIAABCDEFGHIJKLMNOP, use it"}]
+    with pytest.raises(ModelCallDenied) as exc_info:
+        Completions.__new__(Completions).create(model="m", messages=messages)
+
+    assert "sensitive data" in str(exc_info.value).lower()
+    assert calls == []  # the real SDK method never ran
+
+    findings_entries = [e for e in sink.tail(5) if e.to_dict()["kind"] == "sensitive_data"]
+    assert len(findings_entries) == 1
+    assert findings_entries[0].action == "blocked"
+    assert findings_entries[0].surface == "model_prompt"
+
+
+def test_enable_openai_with_scanner_allows_clean_prompt_and_scans_completion(monkeypatch):
+    from openai.resources.chat.completions.completions import Completions
+    from marshal_ai.sensitive import SensitiveDataScanner
+
+    def fake_create(self, **kw):
+        return FakeOpenAIResponse(
+            model=kw["model"],
+            usage=FakeOpenAIUsage(prompt_tokens=5, completion_tokens=5),
+        )
+
+    monkeypatch.setattr(Completions, "create", fake_create, raising=True)
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("m")]}), audit_sink=sink)
+    marshal_integrations.enable_openai(guard, Principal(id="alice"), scanner=SensitiveDataScanner())
+
+    response = Completions.__new__(Completions).create(
+        model="m", messages=[{"role": "user", "content": "hello, how are you?"}]
+    )
+    assert response.model == "m"  # call proceeded normally
+
+    findings_entries = [e for e in sink.tail(5) if e.to_dict()["kind"] == "sensitive_data"]
+    assert findings_entries == []  # nothing sensitive anywhere, nothing written
+
+
+def test_enable_without_scanner_never_scans(monkeypatch):
+    from openai.resources.chat.completions.completions import Completions
+
+    monkeypatch.setattr(
+        Completions,
+        "create",
+        lambda self, **kw: FakeOpenAIResponse(model=kw["model"], usage=FakeOpenAIUsage(1, 1)),
+        raising=True,
+    )
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("m")]}), audit_sink=sink)
+    marshal_integrations.enable_openai(guard, Principal(id="alice"))  # no scanner passed
+
+    # A prompt that would otherwise block, but scanning was never opted into.
+    Completions.__new__(Completions).create(
+        model="m", messages=[{"role": "user", "content": "key AKIAABCDEFGHIJKLMNOP"}]
+    )
+    assert [e for e in sink.tail(5) if e.to_dict()["kind"] == "sensitive_data"] == []

@@ -38,8 +38,18 @@ from marshal_ai.models import (
     ModelPolicy,
     ModelUsageEntry,
 )
+from marshal_ai.sensitive import (
+    DEFAULT_BLOCK_DETECTORS,
+    DEFAULT_DETECTORS,
+    Detector,
+    Finding,
+    SensitiveDataEntry,
+    SensitiveDataPolicy,
+    SensitiveDataScanner,
+    SensitiveDataToolPolicy,
+)
 
-__version__ = "0.3.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "AuditableEvent",
@@ -81,4 +91,12 @@ __all__ = [
     "ModelGuard",
     "ModelPolicy",
     "ModelUsageEntry",
+    "DEFAULT_BLOCK_DETECTORS",
+    "DEFAULT_DETECTORS",
+    "Detector",
+    "Finding",
+    "SensitiveDataEntry",
+    "SensitiveDataPolicy",
+    "SensitiveDataScanner",
+    "SensitiveDataToolPolicy",
 ]

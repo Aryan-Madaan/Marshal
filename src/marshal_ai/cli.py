@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from marshal_ai.audit import AuditableEvent, JSONLAuditSink
+from marshal_ai.audit import AuditableEvent, JSONLAuditSink, is_denied
 
 
 def _summarize(entry: AuditableEvent) -> str:
@@ -41,19 +41,16 @@ def _summarize(entry: AuditableEvent) -> str:
         )
     if kind == "model_usage":
         return f'model={data["model"]} prompt={data["prompt_tokens"]} completion={data["completion_tokens"]}'
+    if kind == "sensitive_data":
+        return f'[{data["surface"]}] {data["location"]}: {data["findings"]} -> {data["action"]}'
     return str(data)
-
-
-def _is_denied(entry: AuditableEvent) -> bool:
-    data = entry.to_dict()
-    return bool(data.get("denied_ids")) or data.get("outcome") in ("deny", "declined")
 
 
 def _format_row(entry: AuditableEvent) -> str:
     data = entry.to_dict()
     ts = datetime.fromtimestamp(entry.timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     kind = data.get("kind", "unknown")
-    flag = "!" if _is_denied(entry) else " "
+    flag = "!" if is_denied(entry) else " "
     return f"{flag} {ts}  {kind:<12} {entry.principal_id:<12} {_summarize(entry)}"
 
 

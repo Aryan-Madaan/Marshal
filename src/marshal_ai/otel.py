@@ -93,11 +93,20 @@ class OpenTelemetryAuditSink(AuditSink):
         span.set_attribute("gen_ai.usage.input_tokens", data["prompt_tokens"])
         span.set_attribute("gen_ai.usage.output_tokens", data["completion_tokens"])
 
+    def _write_sensitive_data(self, span: trace.Span, data: dict[str, Any]) -> None:
+        span.set_attribute("marshal.sensitive.surface", data["surface"])
+        span.set_attribute("marshal.sensitive.location", data["location"])
+        span.set_attribute("marshal.sensitive.findings", data["findings"])
+        span.set_attribute("marshal.sensitive.action", data["action"])
+        if data["action"] == "blocked":
+            span.set_status(Status(StatusCode.ERROR, "sensitive data detected"))
+
     _HANDLERS = {
         "retrieval": _write_retrieval,
         "tool_call": _write_tool_call,
         "model_call": _write_model_call,
         "model_usage": _write_model_usage,
+        "sensitive_data": _write_sensitive_data,
     }
 
 

@@ -36,6 +36,18 @@ internals. `enable()` patches by exact class/method reference, resolved at
 call time — if a future SDK major version renames or restructures these,
 `enable()` will raise ImportError/AttributeError immediately rather than
 patching nothing silently, but it will need updating.
+
+Optional sensitive-data scanning (`scanner=`): this SDK-patch layer is the
+only place in Marshal that ever sees actual prompt/completion *text*
+(`RetrievalGuard`/`ToolGuard`/`ModelGuard` govern document metadata, tool
+arguments, and model names — never message content). Passing a
+`marshal_ai.sensitive.SensitiveDataScanner` here scans outbound prompts
+*before* the network call — a blocking detector (default: hardcoded
+credentials, not PII) raises `ModelCallDenied` before any request is sent,
+the same exception an unrouted model would raise — and scans inbound
+completions afterward, audit-only (the call already happened; there's
+nothing left to block, only to flag). See `marshal_ai.sensitive` for why
+detection is regex-based rather than another LLM call.
 """
 
 from __future__ import annotations
@@ -44,6 +56,7 @@ from typing import Callable, Optional, Union
 
 from marshal_ai.models import ModelCallDenied, ModelGuard
 from marshal_ai.policy import Principal
+from marshal_ai.sensitive import DEFAULT_BLOCK_DETECTORS, SensitiveDataScanner, write_finding
 
 PrincipalSource = Union[Principal, Callable[[], Principal]]
 
@@ -56,29 +69,88 @@ def _resolve_principal(source: PrincipalSource) -> Principal:
     return source()
 
 
-def _make_openai_wrapper(guard: ModelGuard, principal_source: PrincipalSource, original, is_async: bool):
-    if is_async:
-        async def wrapper(self, *args, **kwargs):
-            principal = _resolve_principal(principal_source)
-            requested = kwargs.get("model")
-            if requested is not None:
-                kwargs["model"] = guard.resolve(principal, requested)
-            response = await original(self, *args, **kwargs)
-            _report_openai_usage(guard, principal, response)
-            return response
+def _extract_text_from_messages(messages) -> str:
+    """Best-effort text extraction covering both providers' message shapes:
+    OpenAI's `content` is a string or a list of `{"type": "text", "text":
+    ...}` blocks; Anthropic's is the same list-of-blocks shape. Non-text
+    blocks (images, tool calls) are skipped, not guessed at."""
+    if not messages:
+        return ""
+    parts = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+    return "\n".join(parts)
 
-        return wrapper
 
-    def wrapper(self, *args, **kwargs):
-        principal = _resolve_principal(principal_source)
-        requested = kwargs.get("model")
-        if requested is not None:
-            kwargs["model"] = guard.resolve(principal, requested)
-        response = original(self, *args, **kwargs)
-        _report_openai_usage(guard, principal, response)
-        return response
+def _extract_openai_completion_text(response) -> str:
+    choices = getattr(response, "choices", None) or []
+    parts = []
+    for choice in choices:
+        message = getattr(choice, "message", None)
+        text = getattr(message, "content", None) if message is not None else None
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
 
-    return wrapper
+
+def _extract_anthropic_completion_text(response) -> str:
+    blocks = getattr(response, "content", None) or []
+    parts = []
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _scan_prompt_or_raise(
+    scanner: Optional[SensitiveDataScanner],
+    block_detectors: frozenset[str],
+    guard: ModelGuard,
+    principal: Principal,
+    requested_model: Optional[str],
+    kwargs: dict,
+    extract_text: Callable[[list], str],
+) -> None:
+    if scanner is None:
+        return
+    text = extract_text(kwargs.get("messages"))
+    findings = scanner.scan(text)
+    blocking = [f for f in findings if f.detector in block_detectors]
+    location = requested_model or "?"
+    if blocking:
+        write_finding(guard.audit_log, principal, "model_prompt", location, blocking, "blocked")
+        names = ", ".join(sorted({f.detector for f in blocking}))
+        raise ModelCallDenied(location, f"blocked: sensitive data detected in prompt ({names})")
+    non_blocking = [f for f in findings if f.detector not in block_detectors]
+    if non_blocking:
+        write_finding(guard.audit_log, principal, "model_prompt", location, non_blocking, "audited_only")
+
+
+def _scan_completion(
+    scanner: Optional[SensitiveDataScanner],
+    guard: ModelGuard,
+    principal: Principal,
+    model: Optional[str],
+    text: str,
+) -> None:
+    if scanner is None or not text:
+        return
+    findings = scanner.scan(text)
+    if findings:
+        write_finding(guard.audit_log, principal, "model_completion", model or "?", findings, "audited_only")
+
+
+ExtractText = Callable[[object], str]
+ReportUsage = Callable[[ModelGuard, Principal, object], None]
 
 
 def _report_openai_usage(guard: ModelGuard, principal: Principal, response) -> None:
@@ -93,31 +165,6 @@ def _report_openai_usage(guard: ModelGuard, principal: Principal, response) -> N
         )
 
 
-def _make_anthropic_wrapper(guard: ModelGuard, principal_source: PrincipalSource, original, is_async: bool):
-    if is_async:
-        async def wrapper(self, *args, **kwargs):
-            principal = _resolve_principal(principal_source)
-            requested = kwargs.get("model")
-            if requested is not None:
-                kwargs["model"] = guard.resolve(principal, requested)
-            response = await original(self, *args, **kwargs)
-            _report_anthropic_usage(guard, principal, response)
-            return response
-
-        return wrapper
-
-    def wrapper(self, *args, **kwargs):
-        principal = _resolve_principal(principal_source)
-        requested = kwargs.get("model")
-        if requested is not None:
-            kwargs["model"] = guard.resolve(principal, requested)
-        response = original(self, *args, **kwargs)
-        _report_anthropic_usage(guard, principal, response)
-        return response
-
-    return wrapper
-
-
 def _report_anthropic_usage(guard: ModelGuard, principal: Principal, response) -> None:
     usage = getattr(response, "usage", None)
     model = getattr(response, "model", None)
@@ -130,7 +177,67 @@ def _report_anthropic_usage(guard: ModelGuard, principal: Principal, response) -
         )
 
 
-def enable_openai(guard: ModelGuard, principal: PrincipalSource) -> bool:
+# What actually differs between OpenAI and Anthropic at this layer: how to
+# pull completion text out of their (differently-shaped) response objects,
+# and which usage field names their `usage` object uses. Everything else —
+# principal resolution, prompt scanning, model substitution, calling
+# `original` sync or async, completion scanning — is identical, so it lives
+# once in `_make_wrapper` below instead of twice per provider. Adding a
+# third provider means adding one entry here, not copy-pasting a wrapper.
+_PROVIDER_ADAPTERS: dict[str, tuple[ExtractText, ReportUsage]] = {
+    "openai": (_extract_openai_completion_text, _report_openai_usage),
+    "anthropic": (_extract_anthropic_completion_text, _report_anthropic_usage),
+}
+
+
+def _make_wrapper(
+    guard: ModelGuard,
+    principal_source: PrincipalSource,
+    original,
+    is_async: bool,
+    scanner: Optional[SensitiveDataScanner],
+    block_detectors: frozenset[str],
+    extract_completion_text: ExtractText,
+    report_usage: ReportUsage,
+):
+    def _before(kwargs: dict) -> Principal:
+        principal = _resolve_principal(principal_source)
+        requested = kwargs.get("model")
+        _scan_prompt_or_raise(
+            scanner, block_detectors, guard, principal, requested, kwargs, _extract_text_from_messages
+        )
+        if requested is not None:
+            kwargs["model"] = guard.resolve(principal, requested)
+        return principal
+
+    def _after(principal: Principal, response, kwargs: dict) -> None:
+        report_usage(guard, principal, response)
+        _scan_completion(scanner, guard, principal, kwargs.get("model"), extract_completion_text(response))
+
+    if is_async:
+        async def wrapper(self, *args, **kwargs):
+            principal = _before(kwargs)
+            response = await original(self, *args, **kwargs)
+            _after(principal, response, kwargs)
+            return response
+
+        return wrapper
+
+    def wrapper(self, *args, **kwargs):
+        principal = _before(kwargs)
+        response = original(self, *args, **kwargs)
+        _after(principal, response, kwargs)
+        return response
+
+    return wrapper
+
+
+def enable_openai(
+    guard: ModelGuard,
+    principal: PrincipalSource,
+    scanner: Optional[SensitiveDataScanner] = None,
+    block_detectors: frozenset[str] = DEFAULT_BLOCK_DETECTORS,
+) -> bool:
     """Patch the OpenAI SDK's chat completions client (sync + async), if
     installed. Returns True if patching happened, False if the `openai`
     package isn't importable — never raises just because it's absent."""
@@ -142,12 +249,17 @@ def enable_openai(guard: ModelGuard, principal: PrincipalSource) -> bool:
     except ImportError:
         return False
 
-    _patch_method(Completions, "create", _make_openai_wrapper, guard, principal, is_async=False)
-    _patch_method(AsyncCompletions, "create", _make_openai_wrapper, guard, principal, is_async=True)
+    _patch_method(Completions, "create", guard, principal, False, scanner, block_detectors, "openai")
+    _patch_method(AsyncCompletions, "create", guard, principal, True, scanner, block_detectors, "openai")
     return True
 
 
-def enable_anthropic(guard: ModelGuard, principal: PrincipalSource) -> bool:
+def enable_anthropic(
+    guard: ModelGuard,
+    principal: PrincipalSource,
+    scanner: Optional[SensitiveDataScanner] = None,
+    block_detectors: frozenset[str] = DEFAULT_BLOCK_DETECTORS,
+) -> bool:
     """Patch the Anthropic SDK's messages client (sync + async), if
     installed. Returns True if patching happened, False if the
     `anthropic` package isn't importable — never raises just because it's
@@ -157,27 +269,44 @@ def enable_anthropic(guard: ModelGuard, principal: PrincipalSource) -> bool:
     except ImportError:
         return False
 
-    _patch_method(Messages, "create", _make_anthropic_wrapper, guard, principal, is_async=False)
-    _patch_method(AsyncMessages, "create", _make_anthropic_wrapper, guard, principal, is_async=True)
+    _patch_method(Messages, "create", guard, principal, False, scanner, block_detectors, "anthropic")
+    _patch_method(AsyncMessages, "create", guard, principal, True, scanner, block_detectors, "anthropic")
     return True
 
 
-def _patch_method(cls, attr_name: str, wrapper_factory, guard, principal, is_async: bool) -> None:
+def _patch_method(
+    cls,
+    attr_name: str,
+    guard,
+    principal,
+    is_async: bool,
+    scanner: Optional[SensitiveDataScanner],
+    block_detectors: frozenset[str],
+    provider: str,
+) -> None:
+    extract_completion_text, report_usage = _PROVIDER_ADAPTERS[provider]
     original = getattr(cls, attr_name)
-    wrapped = wrapper_factory(guard, principal, original, is_async)
+    wrapped = _make_wrapper(
+        guard, principal, original, is_async, scanner, block_detectors, extract_completion_text, report_usage
+    )
     wrapped.__marshal_original__ = original  # type: ignore[attr-defined]
     setattr(cls, attr_name, wrapped)
     _patched.append((cls, attr_name, original))
 
 
-def enable(guard: ModelGuard, principal: PrincipalSource) -> list[str]:
+def enable(
+    guard: ModelGuard,
+    principal: PrincipalSource,
+    scanner: Optional[SensitiveDataScanner] = None,
+    block_detectors: frozenset[str] = DEFAULT_BLOCK_DETECTORS,
+) -> list[str]:
     """Patch every installed, supported SDK. Returns the names of what
     actually got patched (e.g. ["openai", "anthropic"]) so you can confirm
     what's actually governed rather than assuming."""
     patched = []
-    if enable_openai(guard, principal):
+    if enable_openai(guard, principal, scanner, block_detectors):
         patched.append("openai")
-    if enable_anthropic(guard, principal):
+    if enable_anthropic(guard, principal, scanner, block_detectors):
         patched.append("anthropic")
     return patched
 

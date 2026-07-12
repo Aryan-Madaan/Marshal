@@ -4,9 +4,13 @@ Marshal is governance for AI systems, one library, three surfaces, one shared au
 trail: `RetrievalGuard` (document/field-level access control on any retriever),
 `ToolGuard` (risk-tiered allow/deny/require-approval on tool calls, with argument
 redaction), `ModelGuard` (logical-name model routing with governed fallback chains
-and per-principal budget enforcement). All three generalize the access-control,
-governance, and cross-jurisdiction compliance work behind TDA and the agent fleet
-at Tata Steel — not generic tutorial clones.
+and per-principal budget enforcement). All three generalize real-world
+access-control, governance, and cross-jurisdiction compliance problems
+seen in production enterprise AI systems — not generic tutorial clones.
+`marshal_ai.sensitive` layers
+deterministic, content-based secret/PII detection across all three, plus the
+SDK-patch integration layer — a different question ("does this content contain
+a secret") from what the three surfaces answer ("is this allowed").
 
 Import name is `marshal_ai` — `marshal` collides with a Python stdlib module, so
 that name was never usable; see the README for the full explanation.
@@ -78,6 +82,42 @@ that name was never usable; see the README for the full explanation.
   below for why this doesn't (and structurally can't, the same way) cover
   tool-call interception.
 
+- **v0.6 — `marshal_ai.sensitive`: deterministic sensitive-data detection.**
+  A different question from every surface above: not "is this allowed" but
+  "does the literal content contain a secret or PII, regardless of who's
+  allowed to see it." A principal can be fully entitled to a document and
+  it can still contain a credential that should never have been embedded;
+  a model can leak one in its own completion without any ACL being
+  violated at all. Deliberately regex-based, not another LLM call — same
+  "who governs the governor" reasoning below: an LLM judge costs money and
+  trust on every document/prompt/completion, and a document engineered to
+  smuggle a prompt injection could plausibly talk an LLM judge out of
+  flagging itself the same way it could talk one into rubber-stamping a
+  malicious tool call. A regex either matches or it doesn't — no added
+  attack surface. `SensitiveDataPolicy` wraps a `Policy` and redacts
+  document content post-ACL-decision (content scanning structurally can't
+  block at `evaluate()` time — that method only ever sees metadata, never
+  content, so there's no clean point to deny an already-fetched, allowed
+  document). `SensitiveDataToolPolicy` wraps a `ToolPolicy` and *can*
+  block, since tool arguments are available at decision time — a
+  hardcoded AWS key or private key in the arguments denies the call
+  outright regardless of risk tier, while non-blocking findings (an email
+  address) get redacted the same way `RedactingToolPolicy` already
+  handles named fields. The SDK-patch layer (`marshal_ai.integrations`)
+  got a `scanner=` param on `enable()` too — it's the only place in
+  Marshal that ever sees actual prompt/completion *text* (the three
+  guards govern metadata, arguments, and model names, never message
+  content), so it's uniquely positioned to block a credential in an
+  outbound prompt *before any network call happens*, and to flag one
+  leaked in a completion afterward (audit-only there — the call already
+  happened, there's nothing left to block). Findings are recorded as
+  `"DETECTOR:count"` only, never the matched text — the same discipline
+  `ToolCallEntry` already applies to redacted arguments, so the audit
+  trail meant to catch a leaked secret can't become a second copy of it.
+  Default block list is narrow on purpose (credentials, not PII) —
+  blocking a document because it contains an email address would make the
+  feature useless on day one; widen `block_detectors=` per deployment.
+
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
 Shared audit infrastructure across surfaces turned out to matter more than
@@ -122,13 +162,45 @@ keeping each surface's scope maximally narrow.
 - **Messy-enterprise-data connector.** Docling handles clean PDFs/DOCX well
   already. This targets what it doesn't: call-recording transcripts, ad-hoc
   spreadsheets, normalized into retrieval-ready chunks with real provenance
-  metadata. Maps to integrating 150+ mixed-format sources into TDA.
+  metadata — the kind of long-tail, mixed-format source mix a real
+  enterprise retrieval system ends up needing to ingest.
 
 - **Async approval queue for `ToolGuard`.** `CLIApprovalHandler` blocks the
   calling thread — fine for a script, not for a real agent that should keep
   working on other things while a human reviews one risky call. Needs a real
   queue (not necessarily infra — could start as a local SQLite-backed one) and
   an `ApprovalHandler` that returns a future/pending state instead of blocking.
+
+- **Runaway-agent circuit breaker.** `BudgetPolicy` catches an agent that's
+  burned through its dollar limit — it does nothing about an agent stuck in a
+  loop calling the *same* tool or model hundreds of times in a few seconds
+  before enough usage has even been reported to trip the budget. This is a
+  real, expensive, well-documented failure mode (a broken termination
+  condition, a tool that "fails" in a way the agent keeps retrying) — a
+  `CircuitBreakerPolicy` wrapping any `ToolPolicy`/`ModelPolicy` could trip
+  after N identical or N failed calls from one principal within a time
+  window and require a human reset, independent of and faster-tripping than
+  dollar-based budgets. Natural pairing with rate limiting (below) —
+  probably one policy wrapper, two trigger conditions.
+
+- **Rate limiting per principal.** Neither `ToolGuard` nor `ModelGuard` cap
+  *how often* a principal can call something, only whether a given call is
+  allowed. A token-bucket `RateLimitPolicy` (thread-safe, same shape as
+  `BudgetPolicy`'s `_spent` tracking) wrapping a base policy would deny once
+  a principal exceeds N calls per window — a cheap, deterministic backstop
+  against both malicious abuse and an agent's own bugs, complementary to
+  (not a replacement for) the circuit breaker above.
+
+- **Policy-as-config (YAML/JSON).** Every policy today is a Python object,
+  which means a compliance reviewer who isn't a Python engineer can't audit
+  or propose a policy change without going through a PR review of code, and
+  a policy change can't be versioned/approved separately from a code
+  deploy. A loader that builds `AttributePolicy`/`RiskTierPolicy`/
+  `AllowlistModelPolicy`/`SensitiveDataPolicy` (and the wrapping
+  `Redacting*`/`SensitiveData*` layers) from a declarative file would let
+  governance rules live in a reviewable, diffable artifact separate from
+  application code — the OPA/Rego precedent, scoped to what Marshal's
+  existing policy shapes can already express rather than a new DSL.
 
 Add more here as they come up — pain points from real work beat cold-cloned ideas.
 

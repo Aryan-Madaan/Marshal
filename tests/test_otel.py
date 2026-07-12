@@ -133,6 +133,42 @@ def test_reads_are_not_supported_since_spans_live_in_the_backend(otel_sink):
         sink.query()
 
 
+def test_sensitive_data_span_error_status_on_block(otel_sink):
+    sink, exporter = otel_sink
+    from marshal_ai.sensitive import SensitiveDataToolPolicy
+    from marshal_ai.tools import AllowAllTools
+
+    policy = SensitiveDataToolPolicy(base=AllowAllTools(), audit_sink=sink)
+    guard = ToolGuard(tool=lambda **kw: "ok", policy=policy, audit_sink=sink, tool_name="save_note")
+
+    with pytest.raises(ToolCallDenied):
+        guard.call(Principal(id="alice"), {"note": "AKIAABCDEFGHIJKLMNOP"})
+
+    spans = exporter.get_finished_spans()
+    sensitive_span = next(s for s in spans if s.name == "marshal.sensitive_data")
+    attrs = dict(sensitive_span.attributes)
+    assert attrs["marshal.sensitive.action"] == "blocked"
+    assert sensitive_span.status.status_code == StatusCode.ERROR
+
+
+def test_sensitive_data_span_ok_status_on_redact(otel_sink):
+    sink, exporter = otel_sink
+    from marshal_ai.sensitive import SensitiveDataPolicy
+
+    policy = SensitiveDataPolicy(base=AttributePolicy(default="allow"), audit_sink=sink)
+    guard = RetrievalGuard(
+        retriever=lambda q, k: [Document(id="1", content="reach bob@example.com")],
+        policy=policy,
+        audit_sink=sink,
+    )
+
+    guard.retrieve("q", principal=Principal(id="alice"), k=1)
+
+    spans = exporter.get_finished_spans()
+    sensitive_span = next(s for s in spans if s.name == "marshal.sensitive_data")
+    assert sensitive_span.status.status_code != StatusCode.ERROR
+
+
 def test_unified_trail_across_all_three_guards_produces_three_spans(otel_sink):
     sink, exporter = otel_sink
     alice = Principal(id="alice")

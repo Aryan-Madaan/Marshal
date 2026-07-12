@@ -60,6 +60,23 @@ class AuditEntry:
 register_entry_type("retrieval", AuditEntry)
 
 
+def is_denied(entry: AuditableEvent) -> bool:
+    """Duck-typed denial check shared by `AuditSink.query(denied_only=True)`
+    and `marshal_ai.cli` — one definition of "was this a denial" so the two
+    can't silently drift apart. Retrieval entries expose `denied_ids`,
+    tool-call/model-call entries expose an `outcome` string, and
+    `marshal_ai.sensitive.SensitiveDataEntry` exposes `action == "blocked"`
+    instead (it has no `outcome` at all). Any future event type just needs
+    to expose one of these three to participate — this module never needs
+    to import the type to recognize it.
+    """
+    return (
+        bool(getattr(entry, "denied_ids", None))
+        or getattr(entry, "outcome", None) in ("deny", "declined")
+        or getattr(entry, "action", None) == "blocked"
+    )
+
+
 class AuditSink(ABC):
     """Where audit entries go. Implement `write` and `all_entries` to plug
     in your own backend (Postgres, a SIEM, Kafka); `tail` and `query` are
@@ -102,15 +119,7 @@ class AuditSink(ABC):
         if until is not None:
             entries = [e for e in entries if e.timestamp <= until]
         if denied_only:
-            # Duck-typed on purpose: retrieval entries expose denied_ids,
-            # tool-call entries expose an outcome string. Any future event
-            # type just needs to expose one of these to participate.
-            entries = [
-                e
-                for e in entries
-                if getattr(e, "denied_ids", None)
-                or getattr(e, "outcome", None) in ("deny", "declined")
-            ]
+            entries = [e for e in entries if is_denied(e)]
         return entries
 
 

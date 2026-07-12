@@ -103,3 +103,39 @@ def test_query_works_on_jsonl_sink_too(tmp_path: Path):
     _populate(sink)
     results = sink.query(principal_id="alice", denied_only=True)
     assert [e.timestamp for e in results] == [2.0]
+
+
+def test_query_denied_only_includes_sensitive_data_blocked_entries():
+    # marshal_ai.sensitive.SensitiveDataEntry has no `outcome`/`denied_ids`
+    # field at all — "blocked" is expressed via `action` instead. A model
+    # prompt blocked by the SDK-patch scanner writes *only* this entry (no
+    # ModelCallEntry — guard.resolve() is never reached), so denied_only
+    # must recognize it or a real denial silently disappears from the view
+    # meant to answer "what got blocked."
+    from marshal_ai.sensitive import SensitiveDataEntry
+
+    sink = InMemoryAuditSink()
+    _populate(sink)
+    sink.write(
+        SensitiveDataEntry(
+            timestamp=5.0,
+            principal_id="carol",
+            surface="model_prompt",
+            location="gpt-4o",
+            findings=["AWS_ACCESS_KEY_ID:1"],
+            action="blocked",
+        )
+    )
+    sink.write(
+        SensitiveDataEntry(
+            timestamp=6.0,
+            principal_id="carol",
+            surface="retrieval",
+            location="doc-1",
+            findings=["EMAIL:1"],
+            action="redacted",  # not a denial — must NOT show up
+        )
+    )
+
+    results = sink.query(denied_only=True)
+    assert [e.timestamp for e in results] == [2.0, 4.0, 5.0]

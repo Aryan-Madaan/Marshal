@@ -6,6 +6,10 @@ model routing with budgets, and one audit trail across all three.
 `pip install`/`import` name is `marshal_ai` (not `marshal` — that name is a
 reserved Python standard-library module, see below).
 
+See [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md) for the architecture,
+the SOLID reasoning behind it, and every real tradeoff considered along
+the way.
+
 ## Why
 
 Most AI-system tooling treats governance as an exercise left to the reader.
@@ -35,6 +39,12 @@ Plus **one-line, framework-agnostic model governance** (`marshal_ai.integrations
 — patches the OpenAI/Anthropic SDK clients directly, so LangChain, LangGraph,
 CrewAI, AutoGen, Google ADK, or a raw script all get governed without
 touching that framework's own code. See below.
+
+Plus **deterministic sensitive-data detection** (`marshal_ai.sensitive`) —
+a different question from the three guards above: not "is this allowed"
+but "does the literal content contain a secret or PII, regardless of who's
+allowed to see it." Plugs into all three surfaces, and into the SDK-patch
+layer to scan real outbound prompts and inbound completions. See below.
 
 See [`ideas.md`](./ideas.md) for what's next: real vector-store adapters,
 and a litellm proxy hook for deployments already running the LiteLLM proxy.
@@ -154,6 +164,32 @@ framework's own dispatch code at a different layer with no equivalent
 single choke point; use `ToolGuard` directly around your tool functions
 for that surface. See `ideas.md` for the reasoning.
 
+## Quickstart: sensitive-data detection
+
+```python
+from marshal_ai import AttributePolicy, Document, Principal, RetrievalGuard, SensitiveDataPolicy
+
+# Wraps your real policy — the ACL decision (who's allowed to see this
+# document) is unchanged; content that looks like a secret/PII gets
+# redacted regardless of who's allowed to see it.
+policy = SensitiveDataPolicy(base=AttributePolicy(default="allow"))
+guard = RetrievalGuard(retriever=my_retriever, policy=policy)
+
+results = guard.retrieve("support tickets", principal=Principal(id="alice"), k=5)
+# a doc's content containing "contact bob@example.com" comes back as
+# "contact [REDACTED:EMAIL]" — the redaction, and a finding count (never
+# the matched text), both land in the audit trail
+```
+
+The same scanner also wraps tool calls (`SensitiveDataToolPolicy` — a
+hardcoded credential in the arguments *blocks the call outright*,
+regardless of risk tier) and the SDK-patch layer (`marshal_integrations.
+enable(guard, principal, scanner=...)` — a credential in an outbound
+prompt is blocked *before any network call*; a completion that leaks one
+is flagged in the audit trail, since by then the call already happened).
+Run `python examples/sensitive_data_example.py` for all three in one
+shared audit trail.
+
 ## How it works
 
 ### Retrieval (`RetrievalGuard`)
@@ -191,6 +227,33 @@ for that surface. See `ideas.md` for the reasoning.
   spend comes from `record_usage`, reported after your real call
   completes; Marshal never estimates cost ahead of time).
 - A denied resolution raises `ModelCallDenied`.
+
+### Sensitive-data detection (`marshal_ai.sensitive`)
+
+- **`SensitiveDataScanner`** — runs a list of `Detector`s (regex, no LLM
+  call — see the module docstring for why) over text. `scan()` reports
+  what fired; `redact()` also replaces matches in place. Both report
+  findings as `Finding(detector, count)` — never the matched text, so the
+  audit trail can't become a second copy of the secret it's meant to
+  catch. Defaults cover common credentials (AWS keys, `sk-`/`ghp_`-style
+  API keys, JWTs, PEM private key blocks) and common PII (email, US
+  phone/SSN, card numbers) — tune `detectors=` per deployment; regexes are
+  heuristics, not ground truth.
+- **`SensitiveDataPolicy`** — wraps a `Policy`, redacts document content
+  after the ACL decision (content-scanning can't block at `evaluate()`
+  time; it only ever sees metadata, not content).
+- **`SensitiveDataToolPolicy`** — wraps a `ToolPolicy`; a *blocking*
+  detector (default: credentials, not PII — see `DEFAULT_BLOCK_DETECTORS`)
+  overrides the base decision to deny outright, since tool arguments are
+  available at decision time. Non-blocking findings are redacted, same as
+  `RedactingToolPolicy`.
+- Both take an `audit_sink=` — pass the *same* sink you give the guard so
+  findings land in the shared trail (there's no automatic wiring between
+  a policy and the guard wrapping it, the same way `RedactingPolicy`
+  doesn't audit anything itself either).
+- The SDK-patch layer (`marshal_ai.integrations.enable(..., scanner=...)`)
+  is the only place that sees real prompt/completion *text* — see its
+  Quickstart above.
 
 ### One audit trail (`AuditSink`)
 
@@ -255,12 +318,13 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.5 — all three governance surfaces (retrieval, tool calls, model
+v0.6 — all three governance surfaces (retrieval, tool calls, model
 routing/budgets), one shared audit trail, OpenTelemetry export, a local
-CLI viewer, and one-line model governance for any OpenAI/Anthropic-based
-framework via SDK patching. Real Chroma integration for `RetrievalGuard`
-is still in progress — see [`ideas.md`](./ideas.md) for that and what's
-next beyond it (a litellm proxy hook for deployments already running the
+CLI viewer, one-line model governance for any OpenAI/Anthropic-based
+framework via SDK patching, and deterministic sensitive-data detection
+across every surface. Real Chroma integration for `RetrievalGuard` is
+still in progress — see [`ideas.md`](./ideas.md) for that and what's next
+beyond it (a litellm proxy hook for deployments already running the
 LiteLLM proxy; framework-specific tool-call adapters).
 
 ## License

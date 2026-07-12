@@ -1,8 +1,9 @@
 from marshal_ai.audit import JSONLAuditSink
 from marshal_ai.cli import build_parser, main
 from marshal_ai.models import AllowlistModelPolicy, ModelCandidate, ModelGuard
-from marshal_ai.policy import Principal
+from marshal_ai.policy import AttributePolicy, Principal
 from marshal_ai.retrieval import Document, RetrievalGuard
+from marshal_ai.sensitive import SensitiveDataPolicy
 from marshal_ai.tools import RiskTierPolicy, ToolCallDenied, ToolGuard
 
 
@@ -87,6 +88,24 @@ def test_denied_rows_are_flagged_and_allowed_rows_are_not(tmp_path, capsys):
     flagged = {l[0] for l in lines}
     assert "!" in flagged  # the denied tool call
     assert " " in flagged  # the allowed retrieval / model call
+
+
+def test_tail_shows_sensitive_data_entries_flagged_when_blocked(tmp_path, capsys):
+    path = tmp_path / "audit.jsonl"
+    sink = JSONLAuditSink(path)
+    policy = SensitiveDataPolicy(base=AttributePolicy(default="allow"), audit_sink=sink)
+    RetrievalGuard(
+        retriever=lambda q, k: [Document(id="1", content="reach bob@example.com")],
+        policy=policy,
+        audit_sink=sink,
+    ).retrieve("q", principal=Principal(id="alice"), k=1)
+
+    main(["tail", str(path)])
+
+    out = capsys.readouterr().out
+    assert "sensitive_data" in out
+    assert "EMAIL:1" in out
+    assert "redacted" in out
 
 
 def test_parser_requires_a_subcommand():
