@@ -1,8 +1,9 @@
 # Marshal
 
 Governance for AI systems: permission-aware retrieval, tool-call approval,
-model routing with budgets and cross-border data-residency/retention
-control, and one audit trail across all three.
+model routing with budgets, cross-border data-residency/retention control,
+and reliability-aware circuit breaking, with one audit trail across all
+three.
 
 **[See the landing page →](https://aryan-madaan.github.io/Marshal/)** — the
 pitch, a live checkpoint demo, and the code, in two minutes.
@@ -69,6 +70,15 @@ law) — Marshal's existing `RiskTierPolicy`/`ToolGuard` and shared audit
 trail already provide the underlying mechanism for that; making the risk
 *tier itself* jurisdiction-aware is a real next step, tracked in
 `ideas.md` rather than folded into this release. See below.
+
+Plus **reliability tracking and circuit breaking** (`CircuitBreakerPolicy`,
+`ModelGuard.record_outcome`) — every policy above decides from static
+config plus the current request; nothing tracked whether a resolved
+deployment's calls were actually *succeeding*. `record_outcome` (auto-
+reported by `marshal_ai.integrations` from real SDK call attempts, success
+or failure, with latency) closes that gap, and `CircuitBreakerPolicy`
+acts on it — routing around a deployment that's recently been failing,
+fail-closed if every candidate has tripped. See below.
 
 See [`ideas.md`](./ideas.md) for what's next: real vector-store adapters,
 and a litellm proxy hook for deployments already running the LiteLLM proxy.
@@ -235,6 +245,48 @@ their actual processing chain — e.g. `"claude-bedrock-eu-west-1"` vs.
 differ exactly in the guarantee that matters here). See `ideas.md` for
 what's explicitly out of scope and why.
 
+## Quickstart: reliability tracking & circuit breaking
+
+```python
+from marshal_ai import AllowlistModelPolicy, CircuitBreakerPolicy, ModelCandidate, ModelGuard, Principal
+
+routes = {"default-chat-model": [ModelCandidate("primary"), ModelCandidate("backup")]}
+policy = CircuitBreakerPolicy(AllowlistModelPolicy(routes), failure_threshold=3, window_seconds=60)
+guard = ModelGuard(policy=policy)
+
+alice = Principal(id="alice")
+model = guard.resolve(alice, "default-chat-model")  # "primary"
+
+# ... make your real call with `model`. If it raises, marshal_ai.integrations
+# reports this automatically; calling it by hand looks like:
+guard.record_outcome(alice, model, success=False, latency_ms=4200.0, error="timeout")
+# after 3 such failures within 60s, "primary" is skipped automatically:
+guard.resolve(alice, "default-chat-model")  # -> "backup", audited as to why
+```
+
+None of Marshal's other policies know whether a resolved deployment is
+*actually working* — `ResidencyPolicy`/`RetentionPolicy` are static legal
+config, `AllowlistModelPolicy`'s ordering is fixed. `CircuitBreakerPolicy`
+is the first policy besides `BudgetPolicy` whose decision depends on
+accumulated runtime history, not just the current request: it trips a
+specific deployment once it has `failure_threshold`+ recorded failures in
+the trailing `window_seconds`, promotes the next already-qualifying
+candidate the same way a jurisdiction or retention mismatch does, and
+fails closed if every candidate is currently tripped. It's deliberately
+not a textbook open/half-open/closed state machine — a trailing time
+window self-heals on its own once the window passes the last failure, no
+separate recovery/probe logic needed.
+
+`marshal_integrations.enable(guard, principal)` (below) calls
+`record_outcome` for you automatically — timing every real call and
+classifying a real failure into a short category (`"timeout"`,
+`"rate_limited"`, `"server_error"`, `"connection_error"`) from the actual
+SDK exception, then **re-raising it unchanged**. Time-to-first-token
+isn't covered yet — that needs wrapping a streaming response's own
+iterator, tracked in `ideas.md` as a separate follow-up, not folded in
+here. Run `python examples/circuit_breaker_example.py` for a fuller
+walkthrough.
+
 ## Quickstart: one-line governance for a framework you didn't write
 
 ```python
@@ -373,6 +425,31 @@ shared audit trail.
   — geography and retention are independent checks; a call can fail
   either one without failing the other.
 
+### Reliability tracking (`CircuitBreakerPolicy`, `ModelOutcomeEntry`)
+
+- **`ModelGuard.record_outcome(principal, model, success, latency_ms=,
+  error=)`** — the sibling to `record_usage` that reports whether a real
+  call *attempt* actually worked, not just what it cost. Writes a
+  `ModelOutcomeEntry` to the audit trail either way. `error` is a short
+  category (`"timeout"`, `"rate_limited"`, `"server_error"`,
+  `"connection_error"`), never a raw exception message.
+- **`CircuitBreakerPolicy`** — wraps any `ModelPolicy`; trips a specific
+  deployment once it has `failure_threshold`+ recorded failures within
+  the trailing `window_seconds`, and searches the base policy's full
+  qualifying candidate list (same `_first_compliant` helper
+  `ResidencyPolicy`/`RetentionPolicy` share) to promote a healthy one
+  instead of denying outright. Fails closed if every candidate is
+  currently tripped.
+- Deliberately a trailing time window, not an open/half-open/closed state
+  machine — self-heals once the window passes the last failure, no
+  separate recovery/probe logic needed.
+- A governance denial is never a recorded failure — `record_outcome` only
+  fires after a call was allowed and actually attempted, same separation
+  `record_usage` already has from the routing decision itself.
+- `marshal_ai.integrations` calls this automatically from real SDK call
+  attempts (see below) — timed, classified, and the original exception is
+  always re-raised unchanged.
+
 ### Sensitive-data detection (`marshal_ai.sensitive`)
 
 - **`SensitiveDataScanner`** — runs a list of `Detector`s (regex, no LLM
@@ -463,16 +540,18 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.7 — all three governance surfaces (retrieval, tool calls, model
-routing/budgets/cross-border data residency/data retention), one shared
-audit trail, OpenTelemetry export, a local CLI viewer, one-line model
-governance for any OpenAI/Anthropic-based framework via SDK patching, and
-deterministic sensitive-data detection across every surface. Real Chroma
-integration for `RetrievalGuard` is still in progress — see
-[`ideas.md`](./ideas.md) for that and what's next beyond it (jurisdiction-
-aware risk tiering for AI-specific regulation like the EU AI Act; a
-litellm proxy hook for deployments already running the LiteLLM proxy;
-framework-specific tool-call adapters).
+v0.8 — all three governance surfaces (retrieval, tool calls, model
+routing/budgets/cross-border data residency/data retention/reliability-
+aware circuit breaking), one shared audit trail, OpenTelemetry export, a
+local CLI viewer, one-line model governance for any OpenAI/Anthropic-based
+framework via SDK patching (now with automatic outcome/latency reporting),
+and deterministic sensitive-data detection across every surface. Real
+Chroma integration for `RetrievalGuard` is still in progress — see
+[`ideas.md`](./ideas.md) for that and what's next beyond it (time-to-
+first-token tracking for streaming calls; jurisdiction-aware risk tiering
+for AI-specific regulation like the EU AI Act; a litellm proxy hook for
+deployments already running the LiteLLM proxy; framework-specific
+tool-call adapters).
 
 ## License
 

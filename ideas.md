@@ -176,12 +176,79 @@ that name was never usable; see the README for the full explanation.
   data-transfer law entirely — see the jurisdiction-aware risk-tiering
   backlog item below for where that actually belongs.
 
+- **v0.8 — `CircuitBreakerPolicy` + `ModelGuard.record_outcome()`:
+  reliability tracking.** Asked directly whether Marshal tracks each LLM
+  call's failures and latency — checked, and the honest answer was no:
+  every policy through v0.7 except `BudgetPolicy` decides from static
+  config plus the current request alone; nothing tracked whether a
+  resolved deployment's calls actually *succeeded*, or fed that back into
+  routing. `ModelGuard.record_outcome(principal, model, success,
+  latency_ms=, error=)` is the missing sibling to `record_usage` — called
+  on every real call *attempt*, success or failure, writing a new
+  `ModelOutcomeEntry` to the audit trail (`error` is a short category,
+  never a raw exception message — same discipline
+  `SensitiveDataEntry.findings` already applies). `CircuitBreakerPolicy`
+  wraps any `ModelPolicy` and trips a specific deployment once it has
+  `failure_threshold`+ recorded failures within a trailing
+  `window_seconds`, reusing the same `_first_compliant` helper
+  `ResidencyPolicy`/`RetentionPolicy` already share to promote a healthy
+  candidate instead of denying outright, and failing closed only if every
+  candidate is currently tripped. Deliberately a plain trailing time
+  window, not a textbook open/half-open/closed state machine — it
+  self-heals once the window passes the last failure, with no separate
+  recovery/probe logic needed, which is simpler and sufficient. A
+  governance denial (Residency/Retention/RiskTier) is never counted as a
+  failure — `record_outcome` only fires after a call was allowed and
+  actually attempted, the same separation `record_usage` already has from
+  the routing decision, so a heavily-governed deployment that correctly
+  denies most calls doesn't look identical to a genuinely broken one.
+  `marshal_ai.integrations` now calls `record_outcome` automatically —
+  timing every real call, classifying a real failure via the actual
+  SDK exception class (`openai`/`anthropic` both expose identical names:
+  `APITimeoutError`, `RateLimitError`, `APIConnectionError`,
+  `InternalServerError` — verified directly in the installed packages,
+  not guessed), and always re-raising the original exception unchanged —
+  this layer only ever observes a failure, it never gatekeeps on it.
+  **Explicitly out of scope, and why**: time-to-first-token, since that
+  only means anything for a streaming call, and the SDK-patch layer
+  doesn't wrap streaming responses at all yet — see the follow-up entry
+  below rather than rushing a bigger, riskier change to the wrapper's
+  return-value contract into the same pass.
+
+This is also the first concrete step toward the "is Marshal becoming a
+platform" question raised alongside this work: a platform (vs. a library)
+is a system that learns from what actually happened and feeds it back into
+future decisions, not just a wider set of static policy shapes. Every
+policy before this one — including `ResidencyPolicy`/`RetentionPolicy` —
+is static config plus the current request. `CircuitBreakerPolicy` is the
+second policy (after `BudgetPolicy`) whose decision depends on accumulated
+runtime history. Genuinely more platform-shaped than what came before it,
+but still a library: no central config store, no cross-process
+aggregation, no dashboard. Policy-as-config (below) is the other missing
+piece of that story, not this one.
+
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
 Shared audit infrastructure across surfaces turned out to matter more than
 keeping each surface's scope maximally narrow.
 
 ## Backlog — not started yet
+
+- **Time-to-first-token tracking for streaming calls.** v0.8's reliability
+  tracking (`record_outcome`, `CircuitBreakerPolicy`) covers total latency
+  and success/failure for ordinary `.create()` calls, but TTFT only means
+  anything for a *streaming* response (`stream=True`), and
+  `marshal_ai.integrations` doesn't wrap streaming responses at all today —
+  verified directly against the file before shipping v0.8, not assumed. A
+  streaming call returns an iterator of chunks, not a single response
+  object with `.usage`; adding TTFT means transparently proxying that
+  iterator (time the first `next()`, keep yielding chunks unchanged, time
+  the last one for total latency, and usage often only arrives in the
+  final chunk) — a materially bigger change to the wrapper's return-value
+  contract than timing a normal call, and one with real risk of breaking a
+  caller that iterates the stream itself. Deserves its own dedicated pass
+  and review, not folding into the same release that shipped non-streaming
+  reliability tracking.
 
 - **Jurisdiction-aware risk tiering for `ToolGuard` (AI-specific regulation,
   not data-transfer law).** `ResidencyPolicy`/`RetentionPolicy` (v0.7) answer
@@ -261,17 +328,23 @@ keeping each surface's scope maximally narrow.
   queue (not necessarily infra — could start as a local SQLite-backed one) and
   an `ApprovalHandler` that returns a future/pending state instead of blocking.
 
-- **Runaway-agent circuit breaker.** `BudgetPolicy` catches an agent that's
+- **Runaway-agent breaker (per-*principal* call frequency, not per-deployment
+  health — a different thing from `CircuitBreakerPolicy` below, name it
+  something that doesn't collide).** `BudgetPolicy` catches an agent that's
   burned through its dollar limit — it does nothing about an agent stuck in a
   loop calling the *same* tool or model hundreds of times in a few seconds
-  before enough usage has even been reported to trip the budget. This is a
-  real, expensive, well-documented failure mode (a broken termination
-  condition, a tool that "fails" in a way the agent keeps retrying) — a
-  `CircuitBreakerPolicy` wrapping any `ToolPolicy`/`ModelPolicy` could trip
-  after N identical or N failed calls from one principal within a time
-  window and require a human reset, independent of and faster-tripping than
-  dollar-based budgets. Natural pairing with rate limiting (below) —
-  probably one policy wrapper, two trigger conditions.
+  before enough usage has even been reported to trip the budget. v0.8's
+  `CircuitBreakerPolicy` doesn't cover this either: it trips a *deployment*
+  based on *failure rate*, which is exactly the wrong shape for a runaway
+  loop that's succeeding every time (a broken termination condition retrying
+  a "successful" no-op tool call isn't a reliability problem, it's a
+  behavioral one). This is a real, expensive, well-documented failure mode —
+  a wrapper (working name `RunawayAgentPolicy`, to keep it distinct from
+  `CircuitBreakerPolicy`) trips after N identical or N failed calls from one
+  *principal* within a time window and requires a human reset, independent
+  of and faster-tripping than dollar-based budgets. Natural pairing with
+  rate limiting (below) — probably one policy wrapper, two trigger
+  conditions.
 
 - **Rate limiting per principal.** Neither `ToolGuard` nor `ModelGuard` cap
   *how often* a principal can call something, only whether a given call is

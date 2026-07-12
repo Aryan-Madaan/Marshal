@@ -22,8 +22,17 @@ governance transparently, without touching the framework's own code:
 
 What this patches, and why only this: the requested `model` on every
 outbound call, substituted for whatever the guard resolves it to, with
-usage from the real response auto-reported via `guard.record_usage`. It
-deliberately does *not* attempt to intercept tool-call execution here —
+usage from the real response auto-reported via `guard.record_usage`, and
+the call's actual outcome — success or failure, and latency — auto-
+reported via `guard.record_outcome` so reliability-tracking policies
+like `CircuitBreakerPolicy` see real deployment health, not just static
+routing config. A failure is classified into a short category (timeout,
+rate-limited, connection error, server error) from the real SDK exception
+raised, then **re-raised unchanged** — this layer only ever observes a
+failure, it never swallows or alters one. Time-to-first-token isn't
+covered yet: that requires wrapping a streaming response's own iterator,
+which this layer doesn't handle yet — see `ideas.md`. It deliberately
+does *not* attempt to intercept tool-call execution here —
 that happens inside each framework's own dispatch code, at a different
 layer with no single choke point the way model calls have one. Use
 `ToolGuard` directly around your tool functions for that surface; see
@@ -52,6 +61,7 @@ detection is regex-based rather than another LLM call.
 
 from __future__ import annotations
 
+import time
 from typing import Callable, Optional, Union
 
 from marshal_ai.models import ModelCallDenied, ModelGuard
@@ -149,6 +159,32 @@ def _scan_completion(
         write_finding(guard.audit_log, principal, "model_completion", model or "?", findings, "audited_only")
 
 
+def _classify_error(exc: BaseException, provider: str) -> str:
+    """Best-effort classification of a real downstream call failure into a
+    short, audit-safe category — checked against each SDK's actual
+    exception classes (openai and anthropic expose identical names for
+    these, verified directly rather than assumed), not guessed from the
+    exception's message text, which could embed request details that
+    shouldn't land in an audit trail. Order matters: openai/anthropic's
+    own hierarchy has APITimeoutError as a subclass of APIConnectionError,
+    and RateLimitError/InternalServerError as subclasses of
+    APIStatusError, so the more specific checks have to run first."""
+    try:
+        sdk = __import__(provider)
+    except ImportError:
+        return "other"
+    if isinstance(exc, sdk.APITimeoutError):
+        return "timeout"
+    if isinstance(exc, sdk.RateLimitError):
+        return "rate_limited"
+    if isinstance(exc, sdk.APIConnectionError):
+        return "connection_error"
+    if isinstance(exc, sdk.APIStatusError):
+        status = getattr(exc, "status_code", None) or 0
+        return "server_error" if status >= 500 else "other"
+    return "other"
+
+
 ExtractText = Callable[[object], str]
 ReportUsage = Callable[[ModelGuard, Principal, object], None]
 
@@ -199,6 +235,7 @@ def _make_wrapper(
     block_detectors: frozenset[str],
     extract_completion_text: ExtractText,
     report_usage: ReportUsage,
+    provider: str,
 ):
     def _before(kwargs: dict) -> Principal:
         principal = _resolve_principal(principal_source)
@@ -214,10 +251,32 @@ def _make_wrapper(
         report_usage(guard, principal, response)
         _scan_completion(scanner, guard, principal, kwargs.get("model"), extract_completion_text(response))
 
+    # Reports every real call *attempt* (success or failure), not just the
+    # success path `_after` above already covers — this is what lets
+    # CircuitBreakerPolicy see actual deployment health, not just static
+    # routing config. A call that never actually happens (denied during
+    # `_before`, before `start` is ever taken) correctly reports nothing:
+    # a governance denial isn't a deployment failure. TTFT specifically
+    # isn't covered here — that requires wrapping a streaming response's
+    # iterator, which this layer doesn't handle yet; see ideas.md.
     if is_async:
         async def wrapper(self, *args, **kwargs):
             principal = _before(kwargs)
-            response = await original(self, *args, **kwargs)
+            resolved_model = kwargs.get("model")
+            start = time.monotonic()
+            try:
+                response = await original(self, *args, **kwargs)
+            except Exception as exc:
+                if resolved_model is not None:
+                    latency_ms = (time.monotonic() - start) * 1000
+                    guard.record_outcome(
+                        principal, resolved_model, success=False,
+                        latency_ms=latency_ms, error=_classify_error(exc, provider),
+                    )
+                raise
+            if resolved_model is not None:
+                latency_ms = (time.monotonic() - start) * 1000
+                guard.record_outcome(principal, resolved_model, success=True, latency_ms=latency_ms)
             _after(principal, response, kwargs)
             return response
 
@@ -225,7 +284,21 @@ def _make_wrapper(
 
     def wrapper(self, *args, **kwargs):
         principal = _before(kwargs)
-        response = original(self, *args, **kwargs)
+        resolved_model = kwargs.get("model")
+        start = time.monotonic()
+        try:
+            response = original(self, *args, **kwargs)
+        except Exception as exc:
+            if resolved_model is not None:
+                latency_ms = (time.monotonic() - start) * 1000
+                guard.record_outcome(
+                    principal, resolved_model, success=False,
+                    latency_ms=latency_ms, error=_classify_error(exc, provider),
+                )
+            raise
+        if resolved_model is not None:
+            latency_ms = (time.monotonic() - start) * 1000
+            guard.record_outcome(principal, resolved_model, success=True, latency_ms=latency_ms)
         _after(principal, response, kwargs)
         return response
 
@@ -287,7 +360,8 @@ def _patch_method(
     extract_completion_text, report_usage = _PROVIDER_ADAPTERS[provider]
     original = getattr(cls, attr_name)
     wrapped = _make_wrapper(
-        guard, principal, original, is_async, scanner, block_detectors, extract_completion_text, report_usage
+        guard, principal, original, is_async, scanner, block_detectors,
+        extract_completion_text, report_usage, provider,
     )
     wrapped.__marshal_original__ = original  # type: ignore[attr-defined]
     setattr(cls, attr_name, wrapped)

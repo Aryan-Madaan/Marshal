@@ -29,12 +29,14 @@ from marshal_ai.models import (
     AllowAllModels,
     AllowlistModelPolicy,
     BudgetPolicy,
+    CircuitBreakerPolicy,
     ModelCallDenied,
     ModelCallEntry,
     ModelCallRequest,
     ModelCandidate,
     ModelDecision,
     ModelGuard,
+    ModelOutcomeEntry,
     ModelPolicy,
     ModelUsageEntry,
     ResidencyPolicy,
@@ -51,7 +53,7 @@ from marshal_ai.sensitive import (
     SensitiveDataToolPolicy,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "AuditableEvent",
@@ -85,12 +87,14 @@ __all__ = [
     "AllowAllModels",
     "AllowlistModelPolicy",
     "BudgetPolicy",
+    "CircuitBreakerPolicy",
     "ModelCallDenied",
     "ModelCallEntry",
     "ModelCallRequest",
     "ModelCandidate",
     "ModelDecision",
     "ModelGuard",
+    "ModelOutcomeEntry",
     "ModelPolicy",
     "ModelUsageEntry",
     "ResidencyPolicy",

@@ -66,6 +66,24 @@ class ModelPolicy(ABC):
         can update spend. Default: no-op (most policies don't track cost)."""
         return None
 
+    def record_outcome(
+        self,
+        principal: Principal,
+        model: str,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Called after a real call *attempt* completes — success or
+        failure — so reliability-tracking policies (e.g.
+        `CircuitBreakerPolicy`) can update their view of a deployment's
+        health. A different question from `record_usage`: usage is
+        reported only on success and answers "what did this cost,"
+        `record_outcome` is reported on every attempt and answers "did
+        this deployment actually work, and how fast." Default: no-op
+        (most policies don't track reliability)."""
+        return None
+
 
 class AllowAllModels(ModelPolicy):
     """No routing/governance configured — the logical name is used as the
@@ -182,6 +200,16 @@ class BudgetPolicy(ModelPolicy):
         cost = (prompt_tokens / 1000) * prompt_rate + (completion_tokens / 1000) * completion_rate
         with self._lock:
             self._spent[principal.id] = self._spent.get(principal.id, 0.0) + cost
+
+    def record_outcome(
+        self,
+        principal: Principal,
+        model: str,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self._base.record_outcome(principal, model, success, latency_ms, error)
 
     def spent_by(self, principal_id: str) -> float:
         return self._spent.get(principal_id, 0.0)
@@ -336,6 +364,16 @@ class ResidencyPolicy(ModelPolicy):
     ) -> None:
         self._base.record_usage(principal, model, prompt_tokens, completion_tokens)
 
+    def record_outcome(
+        self,
+        principal: Principal,
+        model: str,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self._base.record_outcome(principal, model, success, latency_ms, error)
+
 
 class RetentionPolicy(ModelPolicy):
     """Wraps another `ModelPolicy`, keeping its routing decision unchanged
@@ -417,6 +455,120 @@ class RetentionPolicy(ModelPolicy):
     ) -> None:
         self._base.record_usage(principal, model, prompt_tokens, completion_tokens)
 
+    def record_outcome(
+        self,
+        principal: Principal,
+        model: str,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self._base.record_outcome(principal, model, success, latency_ms, error)
+
+
+class CircuitBreakerPolicy(ModelPolicy):
+    """Wraps another `ModelPolicy`, keeping its routing decision unchanged
+    unless the resolved deployment has been failing — answers a question
+    none of `ResidencyPolicy`/`RetentionPolicy`/`BudgetPolicy` can:
+    *is this deployment actually working right now*, based on what
+    recently happened to real calls, not static config. The first policy
+    in Marshal besides `BudgetPolicy` whose decision depends on
+    accumulated runtime history rather than the current request alone.
+
+    A deployment trips once it has `failure_threshold` or more recorded
+    failures within the trailing `window_seconds` — fed by
+    `record_outcome(success=False, ...)`, typically called automatically
+    by `marshal_ai.integrations` when a real downstream call raises. A
+    tripped deployment is skipped the same way a jurisdiction or
+    retention mismatch is: `resolve`/`fallback_chain` search the base
+    policy's full qualifying candidate list (top pick plus its own
+    fallback chain) via the same `_first_compliant` helper
+    `ResidencyPolicy`/`RetentionPolicy` already share, promoting the next
+    non-tripped candidate instead of denying outright — and denying
+    outright, fail-closed, only if every candidate is currently tripped.
+
+    Deliberately *not* a textbook open/half-open/closed circuit-breaker
+    state machine. A trailing time window is self-healing by
+    construction: once `window_seconds` passes the last recorded failure,
+    that failure ages out and the count drops back below threshold with
+    no separate recovery/probe logic needed. Simpler, and sufficient —
+    see `DESIGN_DECISIONS.md` for the tradeoff stated explicitly.
+
+    What does *not* count as a failure here: a governance denial from
+    this policy's own base (or any wrapped policy) — `record_outcome` is
+    only ever called after a call was allowed and actually attempted,
+    the same separation `record_usage` already has from routing
+    decisions. A heavily-governed deployment that correctly denies most
+    calls for compliance reasons must not look identical to a genuinely
+    broken one.
+    """
+
+    def __init__(self, base: ModelPolicy, failure_threshold: int, window_seconds: float) -> None:
+        self._base = base
+        self._failure_threshold = failure_threshold
+        self._window_seconds = window_seconds
+        self._failures: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def _prune(self, model: str, now: float) -> list[float]:
+        cutoff = now - self._window_seconds
+        return [t for t in self._failures.get(model, []) if t >= cutoff]
+
+    def _is_healthy(self, model: str) -> bool:
+        with self._lock:
+            recent = self._prune(model, time.monotonic())
+            self._failures[model] = recent
+        return len(recent) < self._failure_threshold
+
+    def resolve(self, request: ModelCallRequest) -> ModelDecision:
+        decision = self._base.resolve(request)
+        if decision.outcome != "allow":
+            return decision
+        compliant = _first_compliant(self._base, request, self._is_healthy)
+        if not compliant:
+            return ModelDecision(
+                "deny",
+                None,
+                f"every candidate for {request.logical_name!r} has tripped its circuit "
+                f"breaker ({self._failure_threshold}+ failures in the last "
+                f"{self._window_seconds:.0f}s)",
+            )
+        chosen = compliant[0]
+        if chosen == decision.resolved_model:
+            return decision
+        return ModelDecision(
+            "allow",
+            chosen,
+            f"resolved {request.logical_name!r} -> {chosen!r}: base preferred "
+            f"{decision.resolved_model!r}, which has tripped its circuit breaker",
+        )
+
+    def fallback_chain(self, request: ModelCallRequest) -> list[str]:
+        return _first_compliant(self._base, request, self._is_healthy)[1:]
+
+    def record_usage(
+        self, principal: Principal, model: str, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        self._base.record_usage(principal, model, prompt_tokens, completion_tokens)
+
+    def record_outcome(
+        self,
+        principal: Principal,
+        model: str,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self._base.record_outcome(principal, model, success, latency_ms, error)
+        if not success:
+            with self._lock:
+                recent = self._prune(model, time.monotonic())
+                recent.append(time.monotonic())
+                self._failures[model] = recent
+
+    def recent_failure_count(self, model: str) -> int:
+        return len(self._prune(model, time.monotonic()))
+
 
 @dataclass(frozen=True)
 class ModelCallEntry:
@@ -451,6 +603,32 @@ class ModelUsageEntry:
 
 
 register_entry_type("model_usage", ModelUsageEntry)
+
+
+@dataclass(frozen=True)
+class ModelOutcomeEntry:
+    """A record of whether a real call *attempt* to a resolved deployment
+    actually succeeded — separate from both `ModelCallEntry` (the routing
+    decision) and `ModelUsageEntry` (cost, success-only): this is the
+    piece that answers "is this deployment actually working, and how
+    fast," which nothing else in the audit trail captures. `error` is a
+    short category (`"timeout"`, `"rate_limited"`, `"server_error"`,
+    `"connection_error"`, `"other"`) — never a raw exception message,
+    same discipline `SensitiveDataEntry.findings` already applies to
+    what's safe to persist in an audit trail."""
+
+    timestamp: float
+    principal_id: str
+    model: str
+    success: bool
+    latency_ms: Optional[float] = None
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": "model_outcome", **asdict(self)}
+
+
+register_entry_type("model_outcome", ModelOutcomeEntry)
 
 
 class ModelGuard:
@@ -518,5 +696,31 @@ class ModelGuard:
                 model=model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+            )
+        )
+
+    def record_outcome(
+        self,
+        principal: Principal,
+        model: str,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Report whether a real call attempt to `model` succeeded, so
+        reliability-tracking policies (e.g. `CircuitBreakerPolicy`) can
+        update their view of that deployment's health — and so the
+        outcome itself lands in the audit trail. Call this for *every*
+        attempt, success or failure; `record_usage` above only fires on
+        success and only carries cost, not reliability."""
+        self._policy.record_outcome(principal, model, success, latency_ms, error)
+        self._audit_sink.write(
+            ModelOutcomeEntry(
+                timestamp=time.time(),
+                principal_id=principal.id,
+                model=model,
+                success=success,
+                latency_ms=latency_ms,
+                error=error,
             )
         )

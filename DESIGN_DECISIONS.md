@@ -290,6 +290,72 @@ jurisdiction-aware risk-tiering backlog item for the reasoning on each,
 rather than silently pretending the feature covers more ground than it
 does.
 
+## Where `CircuitBreakerPolicy` sits, and why
+
+**Decision point — library vs. platform, made concrete.** Asked directly
+whether Marshal is becoming a "governance platform" and whether it tracks
+LLM call failures/latency. The honest answer, checked against the code
+rather than asserted: every policy through v0.7 — `ResidencyPolicy`,
+`RetentionPolicy`, `RiskTierPolicy`, `AllowlistModelPolicy` — decides from
+static config plus the current request only. `BudgetPolicy` was the one
+exception (spend tracked over time). `CircuitBreakerPolicy` is the second:
+its decision depends on accumulated runtime history (recent failures), not
+just what's in the request. That's the actual dividing line between
+"library" and "platform" — a feedback loop, not a wider set of static
+policy shapes — and it's still a library by that definition: no central
+config store, no cross-process state, no dashboard. Policy-as-config
+(tracked in `ideas.md`) is the other missing piece, not this one.
+
+**Decision point — `record_outcome` as a new, separate reporting path,
+not folded into `record_usage`.** `record_usage` is called only on
+success and answers "what did this cost." `record_outcome` is called on
+every attempt and answers "did this work, and how fast." Conflating them
+would force every existing caller of `record_usage` to also start
+reporting reliability data it doesn't have, or force `record_usage` to be
+called on failure too (with token counts that don't exist for a call that
+never returned). Two questions, two methods, matching the existing
+`ModelCallEntry`/`ModelUsageEntry` split (routing decision vs. reported
+cost) rather than growing either into a catch-all.
+
+**Decision point — a trailing time window, not an open/half-open/closed
+state machine.** The textbook circuit-breaker pattern has three states
+and an explicit recovery probe. A plain trailing window (count recent
+failures, prune anything older than `window_seconds`) gets the same
+practical property — automatic recovery once the underlying problem
+stops recurring — for a fraction of the code and no separate probe logic
+to get wrong. Simpler and sufficient, not a shortcut: documented here so
+a future reader doesn't mistake the missing state machine for an
+oversight.
+
+**Decision point — reused `_first_compliant`, didn't build a fourth
+copy of the same search.** `ResidencyPolicy` and `RetentionPolicy` already
+share this helper for "search the base's top pick plus its fallback
+chain for the first candidate satisfying one more constraint."
+`CircuitBreakerPolicy` needed the exact same shape (find a non-tripped
+candidate) — reusing it instead of writing a third near-identical
+loop is the same DRY call this project already made once in this file's
+own SOLID audit (the `integrations` wrapper consolidation).
+
+**Decision point — governance denials never count as failures.**
+`record_outcome` is only ever called after `ModelGuard.resolve()` already
+returned "allow" and a real call was attempted — never on a
+`ResidencyPolicy`/`RetentionPolicy`/base-policy denial. Getting this
+wrong would mean a deployment correctly, heavily governed (denying most
+calls for compliance reasons) looks identical in the circuit breaker's
+eyes to one that's actually broken — exactly the kind of conflation this
+project's existing tradeoffs section already warns against elsewhere
+(sensitive-data findings vs. matched text, budget vs. risk tier).
+
+**Decision point — real exception classes, verified, not guessed.**
+`_classify_error` in `marshal_ai.integrations` checks `isinstance` against
+`openai`/`anthropic`'s actual exception hierarchy (both installed in the
+dev environment and inspected directly — `APITimeoutError` subclasses
+`APIConnectionError`; `RateLimitError`/`InternalServerError` subclass
+`APIStatusError` — checked via `__mro__`, not assumed from naming
+convention), checking more specific subclasses before their parents.
+Matches the same discipline the `claude-api`-style "never guess SDK
+usage" rule already applies elsewhere in this project's own tooling.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the

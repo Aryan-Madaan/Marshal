@@ -117,6 +117,105 @@ def test_enable_openai_reports_usage_from_the_real_response(monkeypatch):
     assert usage_entries[0].completion_tokens == 42
 
 
+def test_enable_openai_reports_successful_outcome_with_latency(monkeypatch):
+    from openai.resources.chat.completions.completions import Completions
+
+    monkeypatch.setattr(
+        Completions,
+        "create",
+        lambda self, **kw: FakeOpenAIResponse(model=kw["model"], usage=FakeOpenAIUsage(1, 1)),
+        raising=True,
+    )
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("real-model")]}), audit_sink=sink)
+    marshal_integrations.enable_openai(guard, Principal(id="alice"))
+
+    Completions.__new__(Completions).create(model="m", messages=[])
+
+    outcomes = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0].success is True
+    assert outcomes[0].model == "real-model"
+    assert outcomes[0].latency_ms is not None and outcomes[0].latency_ms >= 0
+    assert outcomes[0].error is None
+
+
+def test_enable_openai_reports_failure_outcome_and_still_reraises(monkeypatch):
+    import httpx
+    import openai
+    from openai.resources.chat.completions.completions import Completions
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    real_error = openai.RateLimitError("rate limited", response=httpx.Response(429, request=req), body=None)
+
+    def fake_create(self, **kw):
+        raise real_error
+
+    monkeypatch.setattr(Completions, "create", fake_create, raising=True)
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("real-model")]}), audit_sink=sink)
+    marshal_integrations.enable_openai(guard, Principal(id="alice"))
+
+    # the critical regression: Marshal must never swallow the real error —
+    # it only ever observes a failure here, never gatekeeps on it.
+    with pytest.raises(openai.RateLimitError) as exc_info:
+        Completions.__new__(Completions).create(model="m", messages=[])
+    assert exc_info.value is real_error
+
+    outcomes = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0].success is False
+    assert outcomes[0].model == "real-model"
+    assert outcomes[0].error == "rate_limited"
+    assert outcomes[0].latency_ms is not None
+
+
+def test_enable_openai_classifies_timeout_correctly(monkeypatch):
+    import httpx
+    import openai
+    from openai.resources.chat.completions.completions import Completions
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    def fake_create(self, **kw):
+        raise openai.APITimeoutError(req)
+
+    monkeypatch.setattr(Completions, "create", fake_create, raising=True)
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("real-model")]}), audit_sink=sink)
+    marshal_integrations.enable_openai(guard, Principal(id="alice"))
+
+    with pytest.raises(openai.APITimeoutError):
+        Completions.__new__(Completions).create(model="m", messages=[])
+
+    outcomes = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_outcome"]
+    assert outcomes[0].error == "timeout"
+
+
+def test_denied_call_never_reports_an_outcome(monkeypatch):
+    from openai.resources.chat.completions.completions import Completions
+
+    calls = []
+    monkeypatch.setattr(
+        Completions, "create", lambda self, **kw: calls.append(kw) or None, raising=True
+    )
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({}), audit_sink=sink)  # always denies
+    marshal_integrations.enable_openai(guard, Principal(id="alice"))
+
+    with pytest.raises(ModelCallDenied):
+        Completions.__new__(Completions).create(model="gpt-4o", messages=[])
+
+    # a governance denial isn't a deployment failure — nothing was attempted
+    assert calls == []
+    outcomes = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_outcome"]
+    assert outcomes == []
+
+
 # --- Anthropic -----------------------------------------------------------
 
 
@@ -241,6 +340,35 @@ def test_enable_openai_async_path_substitutes_model_and_reports_usage(monkeypatc
     assert response.model == "gpt-4o-mini"
     usage_entries = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_usage"]
     assert usage_entries[0].prompt_tokens == 4
+
+
+def test_enable_openai_async_path_reports_failure_outcome_and_still_reraises(monkeypatch):
+    import asyncio
+
+    import httpx
+    import openai
+    from openai.resources.chat.completions.completions import AsyncCompletions
+
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    real_error = openai.APITimeoutError(req)
+
+    async def fake_create(self, *args, **kwargs):
+        raise real_error
+
+    monkeypatch.setattr(AsyncCompletions, "create", fake_create, raising=True)
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("real-model")]}), audit_sink=sink)
+    marshal_integrations.enable_openai(guard, Principal(id="alice"))
+
+    client = AsyncCompletions.__new__(AsyncCompletions)
+    with pytest.raises(openai.APITimeoutError) as exc_info:
+        asyncio.run(client.create(model="m", messages=[]))
+    assert exc_info.value is real_error
+
+    outcomes = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_outcome"]
+    assert outcomes[0].success is False
+    assert outcomes[0].error == "timeout"
 
 
 def test_enable_anthropic_async_path_denies_without_calling_original(monkeypatch):

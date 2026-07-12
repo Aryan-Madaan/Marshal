@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from marshal_ai.audit import InMemoryAuditSink
@@ -5,6 +7,7 @@ from marshal_ai.models import (
     AllowAllModels,
     AllowlistModelPolicy,
     BudgetPolicy,
+    CircuitBreakerPolicy,
     ModelCallDenied,
     ModelCandidate,
     ModelGuard,
@@ -372,6 +375,115 @@ def test_residency_and_retention_policies_compose_together():
             context={"jurisdiction": "EU", "max_retention_days": -1},
         )
     assert "retention ceiling" in exc_info.value.reason
+
+
+def test_record_outcome_writes_model_outcome_entry():
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowAllModels(), audit_sink=sink)
+
+    guard.record_outcome(Principal(id="alice"), "gpt-fast", success=True, latency_ms=123.4)
+
+    entry = sink.tail(1)[0]
+    assert entry.to_dict()["kind"] == "model_outcome"
+    assert entry.success is True
+    assert entry.model == "gpt-fast"
+    assert entry.latency_ms == 123.4
+    assert entry.error is None
+
+
+def test_record_outcome_with_failure_and_error_category():
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowAllModels(), audit_sink=sink)
+
+    guard.record_outcome(Principal(id="alice"), "gpt-fast", success=False, error="timeout")
+
+    entry = sink.tail(1)[0]
+    assert entry.success is False
+    assert entry.error == "timeout"
+
+
+def test_circuit_breaker_allows_healthy_deployment():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("a")]})
+    policy = CircuitBreakerPolicy(base, failure_threshold=3, window_seconds=60)
+    guard = ModelGuard(policy=policy)
+
+    assert guard.resolve(Principal(id="alice"), "m") == "a"
+
+
+def test_circuit_breaker_trips_after_threshold_failures_and_promotes_fallback():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("a"), ModelCandidate("b")]})
+    policy = CircuitBreakerPolicy(base, failure_threshold=2, window_seconds=60)
+    guard = ModelGuard(policy=policy)
+    alice = Principal(id="alice")
+
+    assert guard.resolve(alice, "m") == "a"
+
+    guard.record_outcome(alice, "a", success=False)
+    guard.record_outcome(alice, "a", success=False)
+
+    assert guard.resolve(alice, "m") == "b"
+
+
+def test_circuit_breaker_fails_closed_when_every_candidate_is_tripped():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("a"), ModelCandidate("b")]})
+    policy = CircuitBreakerPolicy(base, failure_threshold=1, window_seconds=60)
+    guard = ModelGuard(policy=policy)
+    alice = Principal(id="alice")
+
+    guard.record_outcome(alice, "a", success=False)
+    guard.record_outcome(alice, "b", success=False)
+
+    with pytest.raises(ModelCallDenied) as exc_info:
+        guard.resolve(alice, "m")
+    assert "tripped its circuit breaker" in exc_info.value.reason
+
+
+def test_circuit_breaker_self_heals_once_the_window_elapses():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("a")]})
+    policy = CircuitBreakerPolicy(base, failure_threshold=1, window_seconds=0.05)
+    guard = ModelGuard(policy=policy)
+    alice = Principal(id="alice")
+
+    guard.record_outcome(alice, "a", success=False)
+    with pytest.raises(ModelCallDenied):
+        guard.resolve(alice, "m")
+
+    time.sleep(0.08)  # past the window — the failure ages out on its own
+
+    assert guard.resolve(alice, "m") == "a"
+
+
+def test_circuit_breaker_does_not_trip_on_governance_denials():
+    # a policy that always denies for compliance reasons, not because the
+    # deployment is broken — record_outcome is never called for this, so
+    # the circuit breaker has nothing to trip on. Confirms the two are
+    # correctly independent: policy denials aren't deployment failures.
+    base = AllowlistModelPolicy({})  # always denies: no candidates configured
+    policy = CircuitBreakerPolicy(base, failure_threshold=1, window_seconds=60)
+    guard = ModelGuard(policy=policy)
+    alice = Principal(id="alice")
+
+    for _ in range(5):
+        with pytest.raises(ModelCallDenied):
+            guard.resolve(alice, "m")
+
+    assert policy.recent_failure_count("m") == 0
+
+
+def test_circuit_breaker_composes_with_residency_policy():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("eu-deployment")]})
+    residency = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"eu-deployment": "adequacy_decision"}})
+    policy = CircuitBreakerPolicy(residency, failure_threshold=1, window_seconds=60)
+    guard = ModelGuard(policy=policy)
+    alice = Principal(id="alice")
+
+    assert guard.resolve(alice, "m", context={"jurisdiction": "EU"}) == "eu-deployment"
+
+    guard.record_outcome(alice, "eu-deployment", success=False)
+
+    # tripped and no other jurisdiction-compliant candidate exists -> deny
+    with pytest.raises(ModelCallDenied):
+        guard.resolve(alice, "m", context={"jurisdiction": "EU"})
 
 
 def test_unified_audit_trail_across_all_three_guards():
