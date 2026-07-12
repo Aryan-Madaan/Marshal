@@ -218,6 +218,78 @@ pure, synchronous, local decision. Keeping detection regex-based keeps
 `ideas.md` "who governs the governor" section already worries about for
 tool approval).
 
+## Where `ResidencyPolicy`/`RetentionPolicy` sit, and why
+
+**Decision point — same file as `BudgetPolicy`, not a new module.**
+`marshal_ai.sensitive` above got its own module specifically to avoid a
+circular import (the scanner is needed by wrappers of two different base
+types, `Policy` and `ToolPolicy`, in two different files). Neither new
+class here has that problem: both wrap `ModelPolicy` only, need nothing
+`models.py` doesn't already define, and sit next to their nearest sibling
+in shape — `BudgetPolicy` — for the same reason `RedactingPolicy` lives
+next to `AttributePolicy` rather than off in its own file. Different
+inputs led to the opposite, and equally deliberate, placement decision
+from `sensitive.py`'s.
+
+**Decision point — context, not principal attributes.**
+`ModelCandidate.requires_attribute` already gates candidates on the
+*principal's* identity (role, clearance, region). Jurisdiction and
+required retention ceiling are deliberately read from
+`request.context` instead, because they're facts about the *data in this
+specific call*, not the caller — the same service-account principal
+legitimately makes one call carrying EU-governed data and the next
+carrying India-governed data, and encoding "alice can touch EU data" as a
+static attribute would be both wrong (it isn't about alice) and stale the
+moment her employer's data footprint changes.
+
+**Decision point — search the base's full qualifying list, not just its
+top pick.** The first version of `ResidencyPolicy` only checked whether
+`base.resolve()`'s single preferred candidate was jurisdiction-compliant,
+and denied outright if not — even when a candidate further down the
+base's own `fallback_chain` (already qualified for this principal) would
+have passed. Caught by actually running the example script end-to-end,
+not by a test in isolation: with two unconditional candidates
+(`eu-deployment`, `in-deployment`), a jurisdiction-`"IN"` call always
+failed, because `AllowlistModelPolicy` always prefers `eu-deployment`
+first regardless of jurisdiction. Fixed with a shared `_first_compliant`
+helper: gather `[base's top pick, *base's fallback_chain]`, filter to
+compliant candidates, promote the first survivor. `RetentionPolicy` was
+written after this fix and shares the same helper from the start, rather
+than risking the same bug a second time.
+
+**Decision point — two composable policies, not one combined
+"compliance" policy.** Geography and retention are independent facts
+about the same deployment (a deployment can be in the right country and
+still retain data too long, or vice versa), so they're two single-purpose
+wrappers — `RetentionPolicy(ResidencyPolicy(base, ...), ...)` — matching
+the existing SRP discipline (`RiskTierPolicy` doesn't also redact;
+`BudgetPolicy` doesn't also risk-tier) rather than one class with two
+constructor dicts and an implicit AND between them.
+
+**Decision point — the mechanism is part of the audit record, not just
+the outcome.** The first version of `ResidencyPolicy` recorded jurisdiction
+and resolved deployment but not *why* that pairing was lawful — a gap
+between what this same release's cross-border blog post explicitly
+argues the audit trail needs ("the jurisdiction, the mechanism, and the
+endpoint — not just the outcome") and what the code actually recorded,
+caught on a second pass rather than at first review. Fixed by changing
+`allowed_by_jurisdiction`'s value type from a bare set of deployment names
+to `dict[deployment, mechanism]`, so `resolve()`'s reason string always
+states which adequacy decision/SCC/BCR made a specific transfer lawful,
+not just that one was found.
+
+**Decision point — what's deliberately not enforced.** Confirming a
+vendor's downstream retention/deletion actually matches what a mechanism
+or a `deployment_retention_days` entry promises; sub-processor
+authorization chains beyond deployment-naming discipline; data-subject
+erasure once data has left Marshal's own call boundary; AI-specific
+regulatory classification (EU AI Act-style risk tiers) rather than
+data-transfer law. None of these have a call-time signal Marshal could
+check even in principle — see `ideas.md`'s v0.7 entry and the
+jurisdiction-aware risk-tiering backlog item for the reasoning on each,
+rather than silently pretending the feature covers more ground than it
+does.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the

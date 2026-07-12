@@ -8,6 +8,8 @@ from marshal_ai.models import (
     ModelCallDenied,
     ModelCandidate,
     ModelGuard,
+    ResidencyPolicy,
+    RetentionPolicy,
 )
 from marshal_ai.policy import Principal
 
@@ -174,6 +176,202 @@ def test_budget_policy_preserves_base_denial_reason_when_already_denied():
         guard.resolve(Principal(id="alice"), "unconfigured")
 
     assert "no candidate" in exc_info.value.reason
+
+
+def test_residency_policy_allows_when_resolved_model_covers_the_jurisdiction():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("eu-deployment")]})
+    policy = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"eu-deployment": "adequacy_decision"}})
+    guard = ModelGuard(policy=policy)
+
+    resolved = guard.resolve(Principal(id="alice"), "m", context={"jurisdiction": "EU"})
+    assert resolved == "eu-deployment"
+
+
+def test_residency_policy_records_mechanism_and_controller_in_audit_reason():
+    sink = InMemoryAuditSink()
+    base = AllowlistModelPolicy({"m": [ModelCandidate("eu-deployment")]})
+    policy = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"eu-deployment": "adequacy_decision"}})
+    guard = ModelGuard(policy=policy, audit_sink=sink)
+
+    guard.resolve(
+        Principal(id="alice"),
+        "m",
+        context={"jurisdiction": "EU", "controller": "acme-eu-entity"},
+    )
+
+    entry = sink.tail(1)[0]
+    assert "adequacy_decision" in entry.reason
+    assert "acme-eu-entity" in entry.reason
+
+
+def test_residency_policy_denies_when_jurisdiction_missing_from_context():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("eu-deployment")]})
+    policy = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"eu-deployment": "adequacy_decision"}})
+    guard = ModelGuard(policy=policy)
+
+    with pytest.raises(ModelCallDenied) as exc_info:
+        guard.resolve(Principal(id="alice"), "m")
+
+    assert "jurisdiction not provided" in exc_info.value.reason
+
+
+def test_residency_policy_denies_when_no_deployment_covers_the_jurisdiction():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("us-deployment")]})
+    policy = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"eu-deployment": "adequacy_decision"}})
+    guard = ModelGuard(policy=policy)
+
+    with pytest.raises(ModelCallDenied) as exc_info:
+        guard.resolve(Principal(id="alice"), "m", context={"jurisdiction": "EU"})
+
+    assert "no jurisdiction-compliant deployment" in exc_info.value.reason
+
+
+def test_residency_policy_preserves_base_denial_reason_when_already_denied():
+    base = AllowlistModelPolicy({})  # nothing configured -> always denies
+    policy = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"eu-deployment": "adequacy_decision"}})
+    guard = ModelGuard(policy=policy)
+
+    with pytest.raises(ModelCallDenied) as exc_info:
+        guard.resolve(Principal(id="alice"), "unconfigured", context={"jurisdiction": "EU"})
+
+    assert "no candidate" in exc_info.value.reason
+
+
+def test_residency_policy_fallback_chain_only_contains_jurisdiction_compliant_candidates():
+    base = AllowlistModelPolicy(
+        {
+            "m": [
+                ModelCandidate("primary-eu"),
+                ModelCandidate("backup-eu"),
+                ModelCandidate("backup-us"),
+            ]
+        }
+    )
+    policy = ResidencyPolicy(
+        base,
+        allowed_by_jurisdiction={
+            "EU": {"primary-eu": "adequacy_decision", "backup-eu": "scc_2024_module2"}
+        },
+    )
+    guard = ModelGuard(policy=policy)
+
+    chain = guard.fallback_chain(Principal(id="alice"), "m", context={"jurisdiction": "EU"})
+    assert chain == ["backup-eu"]
+
+
+def test_residency_policy_promotes_a_compliant_fallback_when_top_pick_is_not_compliant():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("eu-deployment"), ModelCandidate("in-deployment")]})
+    policy = ResidencyPolicy(
+        base,
+        allowed_by_jurisdiction={
+            "EU": {"eu-deployment": "adequacy_decision"},
+            "IN": {"in-deployment": "dpdp_section_16"},
+        },
+    )
+    guard = ModelGuard(policy=policy)
+
+    # base always prefers eu-deployment first; a call carrying India-governed
+    # data should still resolve to in-deployment, not deny outright
+    resolved = guard.resolve(Principal(id="alice"), "m", context={"jurisdiction": "IN"})
+    assert resolved == "in-deployment"
+
+
+def test_residency_policy_fallback_chain_empty_when_jurisdiction_missing():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("primary"), ModelCandidate("backup")]})
+    policy = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"backup": "adequacy_decision"}})
+    guard = ModelGuard(policy=policy)
+
+    assert guard.fallback_chain(Principal(id="alice"), "m") == []
+
+
+def test_residency_policy_composes_with_budget_policy():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("eu-deployment")]})
+    residency = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"eu-deployment": "adequacy_decision"}})
+    policy = BudgetPolicy(residency, pricing={"eu-deployment": (1.0, 0.0)}, limit_usd=1.0)
+    guard = ModelGuard(policy=policy)
+    alice = Principal(id="alice")
+
+    resolved = guard.resolve(alice, "m", context={"jurisdiction": "EU"})
+    assert resolved == "eu-deployment"
+
+    guard.record_usage(alice, "eu-deployment", prompt_tokens=1000, completion_tokens=0)
+
+    with pytest.raises(ModelCallDenied):
+        guard.resolve(alice, "m", context={"jurisdiction": "EU"})
+
+
+def test_retention_policy_allows_when_deployment_meets_ceiling():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("zdr-deployment")]})
+    policy = RetentionPolicy(base, deployment_retention_days={"zdr-deployment": 0})
+    guard = ModelGuard(policy=policy)
+
+    resolved = guard.resolve(Principal(id="alice"), "m", context={"max_retention_days": 0})
+    assert resolved == "zdr-deployment"
+
+
+def test_retention_policy_denies_when_max_retention_days_missing_from_context():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("zdr-deployment")]})
+    policy = RetentionPolicy(base, deployment_retention_days={"zdr-deployment": 0})
+    guard = ModelGuard(policy=policy)
+
+    with pytest.raises(ModelCallDenied) as exc_info:
+        guard.resolve(Principal(id="alice"), "m")
+
+    assert "max_retention_days not provided" in exc_info.value.reason
+
+
+def test_retention_policy_denies_when_deployment_retains_longer_than_ceiling():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("thirty-day-deployment")]})
+    policy = RetentionPolicy(base, deployment_retention_days={"thirty-day-deployment": 30})
+    guard = ModelGuard(policy=policy)
+
+    with pytest.raises(ModelCallDenied) as exc_info:
+        guard.resolve(Principal(id="alice"), "m", context={"max_retention_days": 0})
+
+    assert "retention ceiling" in exc_info.value.reason
+
+
+def test_retention_policy_denies_for_unconfigured_deployment():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("unknown-to-retention-config")]})
+    policy = RetentionPolicy(base, deployment_retention_days={})
+    guard = ModelGuard(policy=policy)
+
+    with pytest.raises(ModelCallDenied):
+        guard.resolve(Principal(id="alice"), "m", context={"max_retention_days": 30})
+
+
+def test_retention_policy_promotes_a_compliant_fallback_when_top_pick_retains_too_long():
+    base = AllowlistModelPolicy(
+        {"m": [ModelCandidate("thirty-day-deployment"), ModelCandidate("zdr-deployment")]}
+    )
+    policy = RetentionPolicy(
+        base, deployment_retention_days={"thirty-day-deployment": 30, "zdr-deployment": 0}
+    )
+    guard = ModelGuard(policy=policy)
+
+    resolved = guard.resolve(Principal(id="alice"), "m", context={"max_retention_days": 0})
+    assert resolved == "zdr-deployment"
+
+
+def test_residency_and_retention_policies_compose_together():
+    base = AllowlistModelPolicy({"m": [ModelCandidate("eu-zdr-deployment")]})
+    residency = ResidencyPolicy(base, allowed_by_jurisdiction={"EU": {"eu-zdr-deployment": "adequacy_decision"}})
+    policy = RetentionPolicy(residency, deployment_retention_days={"eu-zdr-deployment": 0})
+    guard = ModelGuard(policy=policy)
+
+    resolved = guard.resolve(
+        Principal(id="alice"), "m", context={"jurisdiction": "EU", "max_retention_days": 0}
+    )
+    assert resolved == "eu-zdr-deployment"
+
+    # geography passes but retention doesn't: same deployment, stricter ceiling
+    with pytest.raises(ModelCallDenied) as exc_info:
+        guard.resolve(
+            Principal(id="alice"),
+            "m",
+            context={"jurisdiction": "EU", "max_retention_days": -1},
+        )
+    assert "retention ceiling" in exc_info.value.reason
 
 
 def test_unified_audit_trail_across_all_three_guards():

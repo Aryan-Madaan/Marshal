@@ -1,7 +1,8 @@
 # Marshal
 
 Governance for AI systems: permission-aware retrieval, tool-call approval,
-model routing with budgets, and one audit trail across all three.
+model routing with budgets and cross-border data-residency/retention
+control, and one audit trail across all three.
 
 `pip install`/`import` name is `marshal_ai` (not `marshal` — that name is a
 reserved Python standard-library module, see below).
@@ -45,6 +46,26 @@ a different question from the three guards above: not "is this allowed"
 but "does the literal content contain a secret or PII, regardless of who's
 allowed to see it." Plugs into all three surfaces, and into the SDK-patch
 layer to scan real outbound prompts and inbound completions. See below.
+
+Plus **cross-border data governance** (`ResidencyPolicy`, `RetentionPolicy`)
+— a model call to a foreign-hosted deployment is a cross-border transfer
+of whatever data is in that prompt, and GDPR, India's DPDP Act, Thailand's
+PDPA, and Singapore's PDPA each apply a genuinely different legal test to
+that same act. `ResidencyPolicy` wraps any `ModelPolicy` and denies,
+fail-closed, if the resolved deployment isn't a compliant destination
+(and legal mechanism — adequacy, SCC, BCR) for the jurisdiction governing
+that specific request; `RetentionPolicy` separately denies unless the
+resolved deployment's actual retention terms meet a required ceiling
+(zero-data-retention included) — two independent questions, "where" and
+"how long," both read from request context rather than the calling
+principal's identity, since whose law and whose contract terms apply are
+properties of the data, not of who's asking. Note what this deliberately
+doesn't cover: AI-specific regulatory classification (the EU AI Act's
+risk-tiering and mandatory human oversight, distinct from data-transfer
+law) — Marshal's existing `RiskTierPolicy`/`ToolGuard` and shared audit
+trail already provide the underlying mechanism for that; making the risk
+*tier itself* jurisdiction-aware is a real next step, tracked in
+`ideas.md` rather than folded into this release. See below.
 
 See [`ideas.md`](./ideas.md) for what's next: real vector-store adapters,
 and a litellm proxy hook for deployments already running the LiteLLM proxy.
@@ -129,6 +150,87 @@ for candidate in guard.fallback_chain(alice, "default-chat-model"):
 ```
 
 Run `python examples/model_governance_example.py` for a fuller walkthrough.
+
+## Quickstart: cross-border data residency
+
+```python
+from marshal_ai import AllowlistModelPolicy, ModelCandidate, ModelGuard, Principal, ResidencyPolicy
+
+routes = {
+    "default-chat-model": [
+        ModelCandidate("eu-deployment"),
+        ModelCandidate("in-deployment"),
+    ]
+}
+policy = ResidencyPolicy(
+    AllowlistModelPolicy(routes),
+    allowed_by_jurisdiction={
+        "EU": {"eu-deployment": "adequacy_decision"},
+        "IN": {"in-deployment": "dpdp_section_16"},
+    },
+)
+guard = ModelGuard(policy=policy)
+
+alice = Principal(id="alice")
+# jurisdiction describes whose data this call carries, not who alice is —
+# the same principal can make calls covering different jurisdictions
+model = guard.resolve(alice, "default-chat-model", context={"jurisdiction": "EU"})
+# "eu-deployment" — the one candidate actually permitted for EU-governed data,
+# and the audit trail records *why*: "...via 'adequacy_decision'"
+
+guard.resolve(alice, "default-chat-model", context={"jurisdiction": "TH"})
+# raises ModelCallDenied — no candidate covers Thailand yet. Fails closed,
+# not a silent fall-through to whatever deployment is first in the list.
+```
+
+`allowed_by_jurisdiction` maps jurisdiction → `{deployment: mechanism}` — the
+mechanism string (an adequacy decision, a signed SCC, a BCR, a
+certification) is what makes that pairing lawful, and it's what lands in
+the audit trail's reason alongside the jurisdiction and the resolved
+deployment, not just the allow/deny outcome. That mapping is a decision
+only your data controller/fiduciary can make (GDPR calls the role
+controller, India's DPDP Act calls it data fiduciary, Singapore's PDPA
+calls the processor side a data intermediary — different labels, same
+functional split) — Marshal enforces that decision deterministically at
+every call, it doesn't make it for you, and it doesn't verify the
+mechanism is still real; keep it in sync with your actual DPA. Pass an
+optional `context={"controller": "..."}` too, purely for audit
+traceability back to whichever entity's instructions this config encodes.
+Run `python examples/residency_example.py` for a fuller walkthrough.
+
+## Quickstart: data-retention control
+
+```python
+from marshal_ai import AllowlistModelPolicy, ModelCandidate, ModelGuard, Principal, RetentionPolicy
+
+policy = RetentionPolicy(
+    AllowlistModelPolicy({"m": [ModelCandidate("thirty-day-vendor"), ModelCandidate("zdr-vendor")]}),
+    deployment_retention_days={"thirty-day-vendor": 30, "zdr-vendor": 0},
+)
+guard = ModelGuard(policy=policy)
+
+alice = Principal(id="alice")
+guard.resolve(alice, "m", context={"max_retention_days": 0})
+# "zdr-vendor" — the only deployment with a zero-data-retention agreement;
+# thirty-day-vendor is skipped even though it's the base policy's top pick
+```
+
+A different question from residency, and an independent one: a deployment
+can sit in the right country and still retain prompts for weeks under a
+vendor's default abuse-monitoring window — exactly what a
+zero-data-retention (ZDR) requirement exists to rule out. Stack both when
+both matter: `RetentionPolicy(ResidencyPolicy(base, ...), ...)`. Same
+fail-closed discipline: `max_retention_days` missing from context denies
+outright, same as a missing jurisdiction does for `ResidencyPolicy`.
+
+**What neither policy attempts**, because Marshal has no way to verify it
+at call time: confirming a vendor's downstream retention/deletion actually
+matches what a mechanism promises, or enforcing sub-processor
+authorization chains beyond how you name your deployments (name them by
+their actual processing chain — e.g. `"claude-bedrock-eu-west-1"` vs.
+`"claude-foundry-global"` — since two deployments of "the same model" can
+differ exactly in the guarantee that matters here). See `ideas.md` for
+what's explicitly out of scope and why.
 
 ## Quickstart: one-line governance for a framework you didn't write
 
@@ -228,6 +330,46 @@ shared audit trail.
   completes; Marshal never estimates cost ahead of time).
 - A denied resolution raises `ModelCallDenied`.
 
+### Data residency (`ResidencyPolicy`)
+
+- Wraps any `ModelPolicy` the same way `BudgetPolicy` does — the base
+  policy's routing decision passes through unchanged unless the resolved
+  deployment isn't a jurisdiction-compliant one.
+- Reads jurisdiction from `request.context["jurisdiction"]`, not from the
+  principal's attributes — which country's law governs a piece of data is
+  a property of that data, not of who's making the call.
+- `allowed_by_jurisdiction` maps jurisdiction → `{deployment: mechanism}` —
+  the mechanism (adequacy decision, SCC, BCR, certification) lands in the
+  audit reason alongside the jurisdiction and resolved deployment, so the
+  trail records *why* a transfer was lawful, not just that it was allowed.
+  An optional `context["controller"]` rides along too, purely for
+  traceability back to the accountable entity.
+- Doesn't just check the base's top pick: if a *later*, already-qualifying
+  candidate from the base's own fallback chain is jurisdiction-compliant,
+  that one is promoted instead of denying outright.
+- Fails closed on two distinct conditions: jurisdiction missing from
+  context, or a jurisdiction present but uncovered by any candidate. Both
+  deny outright — no silent fallback to whatever deployment happens to be
+  first in the list.
+- `fallback_chain` is filtered the same way `resolve` is: a fallback can
+  never route jurisdiction-governed data to a non-compliant deployment
+  just because the preferred one is down.
+
+### Data retention (`RetentionPolicy`)
+
+- Same wrapping shape as `ResidencyPolicy`, checking a different,
+  independent fact: not *where* a deployment sits but *how long* it's
+  allowed to keep what it's sent, per `deployment_retention_days`.
+- Reads the required ceiling from `request.context["max_retention_days"]`
+  — `0` means "this call requires a zero-data-retention deployment."
+- Same fail-closed discipline, same fallback-promotion behavior as
+  `ResidencyPolicy` — both share a private `_first_compliant` helper
+  rather than duplicating that candidate-search logic twice.
+- Compose the two when both matter:
+  `RetentionPolicy(ResidencyPolicy(base, ...), deployment_retention_days=...)`
+  — geography and retention are independent checks; a call can fail
+  either one without failing the other.
+
 ### Sensitive-data detection (`marshal_ai.sensitive`)
 
 - **`SensitiveDataScanner`** — runs a list of `Detector`s (regex, no LLM
@@ -318,14 +460,16 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.6 — all three governance surfaces (retrieval, tool calls, model
-routing/budgets), one shared audit trail, OpenTelemetry export, a local
-CLI viewer, one-line model governance for any OpenAI/Anthropic-based
-framework via SDK patching, and deterministic sensitive-data detection
-across every surface. Real Chroma integration for `RetrievalGuard` is
-still in progress — see [`ideas.md`](./ideas.md) for that and what's next
-beyond it (a litellm proxy hook for deployments already running the
-LiteLLM proxy; framework-specific tool-call adapters).
+v0.7 — all three governance surfaces (retrieval, tool calls, model
+routing/budgets/cross-border data residency/data retention), one shared
+audit trail, OpenTelemetry export, a local CLI viewer, one-line model
+governance for any OpenAI/Anthropic-based framework via SDK patching, and
+deterministic sensitive-data detection across every surface. Real Chroma
+integration for `RetrievalGuard` is still in progress — see
+[`ideas.md`](./ideas.md) for that and what's next beyond it (jurisdiction-
+aware risk tiering for AI-specific regulation like the EU AI Act; a
+litellm proxy hook for deployments already running the LiteLLM proxy;
+framework-specific tool-call adapters).
 
 ## License
 

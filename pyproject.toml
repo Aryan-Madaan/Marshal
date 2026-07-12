@@ -1,7 +1,7 @@
 [project]
 name = "marshal-ai"
-version = "0.6.0"
-description = "Governance for AI systems: permission-aware retrieval, tool-call approval, model routing/budgets, and an audit trail — one library, one place to see what happened."
+version = "0.7.0"
+description = "Governance for AI systems: permission-aware retrieval, tool-call approval, model routing/budgets/data-residency, and an audit trail — one library, one place to see what happened."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Aryan Madaan" }]

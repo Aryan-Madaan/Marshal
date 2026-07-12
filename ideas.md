@@ -118,12 +118,102 @@ that name was never usable; see the README for the full explanation.
   blocking a document because it contains an email address would make the
   feature useless on day one; widen `block_detectors=` per deployment.
 
+- **v0.7 — `ResidencyPolicy` + `RetentionPolicy`: cross-border data
+  governance for `ModelGuard`.** A model call to a foreign-hosted
+  deployment is a cross-border transfer of whatever data is in that
+  prompt — GDPR, India's DPDP Act, Thailand's PDPA, and Singapore's PDPA
+  each apply a genuinely different legal test to that same act (a
+  whitelist with enumerated exceptions, a blacklist that's currently
+  empty, an unpublished adequacy list that makes contracts mandatory by
+  default, and a per-transfer "comparable protection" standard,
+  respectively — four different mechanisms, not four strictness levels
+  of one mechanism). Both policies wrap any `ModelPolicy` the same way
+  `BudgetPolicy` does, and both read their deciding fact from
+  `request.context`, not from the calling principal's attributes —
+  jurisdiction and required retention ceiling are properties of the
+  data in the call, not of who's making it, so the same principal can
+  make one call carrying EU-governed data and the next carrying
+  India-governed data without either fact leaking onto their identity.
+  `ResidencyPolicy` additionally records the *transfer mechanism*
+  (adequacy decision, SCC, BCR, certification) in the audit reason, not
+  just the allow/deny outcome — recording *why* a transfer was lawful is
+  a distinct requirement from recording *that* it was allowed, and the
+  first version of this shipped without that distinction until a
+  review pass caught the gap between what the cross-border blog post
+  this shipped alongside actually argued for and what the code recorded.
+  `RetentionPolicy` answers an independent question — not where a
+  deployment sits but how long it's allowed to keep what it's sent
+  (`max_retention_days=0` for a zero-data-retention requirement) — a
+  deployment can be geographically compliant and still violate a ZDR
+  agreement, or vice versa, so the two checks are separate, composable
+  wrappers rather than one combined policy. Both fail closed on missing
+  context, not just on an explicit non-match — an unstamped call is
+  treated the same as a non-compliant one, since a silent default
+  deployment is exactly the failure mode both policies exist to close
+  off. Both search the base policy's full qualifying candidate list
+  (top pick plus fallback chain), not just its top pick, promoting a
+  compliant candidate further down that same already-qualified list
+  instead of denying outright — sharing one private `_first_compliant`
+  helper rather than duplicating that search twice. An optional
+  `context["controller"]` rides along in `ResidencyPolicy`'s audit
+  reason purely for traceability back to whichever entity's actual DPA
+  the `allowed_by_jurisdiction`/`deployment_retention_days` config is
+  supposed to encode — Marshal enforces that config deterministically,
+  it doesn't validate that it's still accurate; keeping it in sync with
+  a renegotiated contract is on whoever owns the config, the same way
+  `BudgetPolicy`'s pricing table needs updating when a vendor's prices
+  change. **Explicitly out of scope, and why**: confirming a vendor's
+  downstream retention/deletion actually matches what it promises (no
+  API exists for Marshal to verify that from the outside); enforcing
+  sub-processor authorization chains beyond deployment-naming
+  convention (name deployments by their actual processing chain, e.g.
+  `"claude-bedrock-eu-west-1"` vs. `"claude-foundry-global"`, since two
+  deployments of "the same model" can differ exactly in the guarantee
+  that matters here); data-subject erasure requests once data has left
+  Marshal's own boundary (a downstream vendor-system problem, not a
+  routing-time one); and AI-specific regulatory classification like the
+  EU AI Act's risk tiers, which is a different category of law from
+  data-transfer law entirely — see the jurisdiction-aware risk-tiering
+  backlog item below for where that actually belongs.
+
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
 Shared audit infrastructure across surfaces turned out to matter more than
 keeping each surface's scope maximally narrow.
 
 ## Backlog — not started yet
+
+- **Jurisdiction-aware risk tiering for `ToolGuard` (AI-specific regulation,
+  not data-transfer law).** `ResidencyPolicy`/`RetentionPolicy` (v0.7) answer
+  "where can this data go" and "how long can it be kept there" — both
+  data-protection questions. A genuinely different regulatory category
+  sits on top of that: AI-specific regulation like the EU AI Act, which
+  doesn't ask where data goes, it asks whether *this specific action*
+  requires mandatory human oversight before it happens, based on a risk
+  classification (Annex III's high-risk categories — employment,
+  creditworthiness, and others). Marshal already has the right-shaped
+  primitives for this — `RiskTierPolicy`'s allow/deny/require_approval
+  outcome *is* the "mandatory human oversight" mechanism, and the shared
+  `AuditSink` is the "automatic logging for traceability" Article 12/19
+  already require (see the reasoning already written up for this in the
+  `enterprise-intelligence.mdx` blog post). What's missing: the risk
+  *classification itself* can be jurisdiction-dependent — the same tool
+  call (an AI-assisted hiring recommendation, say) is Annex-III
+  high-risk specifically in the EU, and may carry no equivalent
+  classification in a jurisdiction with no AI-specific regulatory regime
+  yet. `RiskTierPolicy` today takes one flat tier→outcome table with no
+  jurisdiction axis. The fix is the same wrapping shape as
+  `ResidencyPolicy`, applied to `ToolPolicy` instead of `ModelPolicy`: a
+  `JurisdictionalRiskTierPolicy` that reads jurisdiction from
+  `ToolCallRequest`'s context and overrides the required outcome per
+  jurisdiction — forcing `require_approval` for an EU-governed call in an
+  Annex-III category even where the base policy would otherwise allow it
+  outright. Deliberately not folded into v0.7: it's a different
+  regulatory question living on a different guard (`ToolGuard`, not
+  `ModelGuard`), and v0.7 was already three real additions
+  (`ResidencyPolicy`, `RetentionPolicy`, and the mechanism/controller
+  tracking added to both) — worth its own release rather than further
+  scope creep on this one.
 
 - **Real vector-store integration for `RetrievalGuard`.** Everything's only ever
   been proven against a fake in-memory retriever. A real Chroma adapter (via

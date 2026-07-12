@@ -4,7 +4,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
 from marshal_ai.policy import Principal
@@ -185,6 +185,237 @@ class BudgetPolicy(ModelPolicy):
 
     def spent_by(self, principal_id: str) -> float:
         return self._spent.get(principal_id, 0.0)
+
+
+def _first_compliant(
+    base: ModelPolicy, request: ModelCallRequest, is_compliant: "Callable[[str], bool]"
+) -> list[str]:
+    """Every candidate `base` already qualified this principal for — its
+    top pick plus its own fallback chain, in order — filtered down to
+    ones satisfying `is_compliant`. Empty if the base denies, or nothing
+    qualifies.
+
+    Shared by every wrapping `ModelPolicy` below that layers one more
+    compliance constraint on top of a base's routing (`ResidencyPolicy`,
+    `RetentionPolicy`): each needs the same behavior when its own
+    constraint rules out the base's top pick — promote the next
+    candidate the base *already* qualified this principal for, rather
+    than denying outright just because the first one didn't also clear
+    the new constraint. That's the same governed-substitution reasoning
+    `AllowlistModelPolicy.fallback_chain` establishes for its own
+    attribute gate, applied consistently to every later constraint
+    stacked on top of it.
+    """
+    decision = base.resolve(request)
+    if decision.outcome != "allow":
+        return []
+    candidates = [decision.resolved_model, *base.fallback_chain(request)]
+    return [c for c in candidates if is_compliant(c)]
+
+
+class ResidencyPolicy(ModelPolicy):
+    """Wraps another `ModelPolicy`, keeping its routing decision unchanged
+    unless the resolved model isn't a compliant deployment for the
+    request's jurisdiction — answers *where* this data is allowed to be
+    processed.
+
+    Reads jurisdiction from `request.context["jurisdiction"]`,
+    deliberately *not* from a principal attribute the way
+    `ModelCandidate.requires_attribute` gates on identity/role. Which
+    country's law governs a piece of data is a property of that data (or
+    of the person it's about), not of who's asking to process it — the
+    same request, on behalf of the same principal, can carry EU-governed
+    data one call and India-governed data the next. That's decided once,
+    at ingestion, and passed through as context; it isn't something the
+    principal's own attributes should encode.
+
+    `allowed_by_jurisdiction` maps jurisdiction -> {deployment name ->
+    transfer mechanism}, e.g. `{"EU": {"eu-deployment": "adequacy_decision"},
+    "TH": {"th-deployment": "scc_2024_module2"}}`. The mechanism string
+    isn't decoration: "is this transfer allowed" and "under what
+    documented legal basis is it allowed" are different questions with
+    different audit requirements (GDPR Article 46 and Thailand's PDPA
+    Section 29 both require an actual documented safeguard, not just a
+    country that happens to be permissible), and the mechanism is what
+    lands in the audit trail's `reason` field alongside the jurisdiction
+    and the resolved deployment — recording *why* a transfer was lawful,
+    not just that it was allowed.
+
+    Fails closed on two distinct conditions, not just one: jurisdiction
+    missing from context entirely, or a jurisdiction that's present but
+    has no compliant deployment among the base policy's candidates. Both
+    deny outright. There is deliberately no silent default deployment to
+    fall back to — that silent fallback is exactly the failure mode this
+    class exists to close off; see `ideas.md` and the cross-border data
+    transfer post this shipped alongside for the full argument.
+
+    Optionally reads `request.context["controller"]` — an identifier for
+    whichever entity is legally accountable for this data (a group
+    company, a customer, a business unit) — and folds it into the audit
+    reason purely for traceability. Marshal doesn't validate it against
+    anything; it exists so a later audit query can be reconciled against
+    the entity whose instructions `allowed_by_jurisdiction` is supposed
+    to encode, per the controller/processor note below.
+
+    One more thing this class is deliberately *not*: a substitute for the
+    controller/processor legal analysis. GDPR calls the two roles
+    controller and processor; India's DPDP Act calls them data fiduciary
+    and data processor; Singapore's PDPA calls the processor role a data
+    intermediary — different labels, same functional split in every
+    regime this policy is meant to help with. Only the controller (the
+    entity that decides *why* the data is being processed) has the legal
+    standing to decide which destinations a transfer of that data may
+    lawfully go to, and under what mechanism. `allowed_by_jurisdiction` is
+    that controller's decision, expressed as config — Marshal enforces it
+    deterministically at every call, it doesn't make it, and it doesn't
+    verify that the mechanism string is still valid or was ever real. If
+    the application calling this policy is itself a processor/data
+    intermediary acting on someone else's instructions, this config
+    should be populated from that controller's actual instructions
+    (typically the same ones already captured in the processing
+    agreement/DPA), kept in sync as those instructions change — not
+    decided ad hoc, and not left stale, by whoever wires up `ModelGuard`.
+
+    What this class deliberately does *not* attempt, because Marshal has
+    no way to verify it at call time: confirming a vendor's downstream
+    retention or deletion actually matches what a mechanism promises
+    (see `RetentionPolicy` for the retention axis specifically), or
+    enforcing sub-processor authorization chains beyond how you name
+    your deployments. Name deployments by their actual processing chain
+    (e.g. `"claude-bedrock-eu-west-1"` vs. `"claude-foundry-global"`) if
+    that distinction matters for your compliance posture — two
+    deployments of "the same model" can differ exactly in the residency
+    and sub-processor guarantee that matters here.
+    """
+
+    def __init__(
+        self, base: ModelPolicy, allowed_by_jurisdiction: dict[str, dict[str, str]]
+    ) -> None:
+        self._base = base
+        self._allowed_by_jurisdiction = allowed_by_jurisdiction
+
+    def resolve(self, request: ModelCallRequest) -> ModelDecision:
+        decision = self._base.resolve(request)
+        if decision.outcome != "allow":
+            return decision
+        jurisdiction = request.context.get("jurisdiction")
+        if jurisdiction is None:
+            return ModelDecision(
+                "deny",
+                None,
+                "jurisdiction not provided in context — refusing to resolve without it",
+            )
+        mechanisms = self._allowed_by_jurisdiction.get(jurisdiction, {})
+        compliant = _first_compliant(self._base, request, lambda c: c in mechanisms)
+        if not compliant:
+            return ModelDecision(
+                "deny",
+                None,
+                f"no jurisdiction-compliant deployment for {jurisdiction!r} among "
+                f"candidates for {request.logical_name!r}",
+            )
+        chosen = compliant[0]
+        controller = request.context.get("controller")
+        controller_note = f", controller {controller!r}" if controller else ""
+        return ModelDecision(
+            "allow",
+            chosen,
+            f"resolved {request.logical_name!r} -> {chosen!r} for jurisdiction "
+            f"{jurisdiction!r} via {mechanisms[chosen]!r}{controller_note}",
+        )
+
+    def fallback_chain(self, request: ModelCallRequest) -> list[str]:
+        jurisdiction = request.context.get("jurisdiction")
+        if jurisdiction is None:
+            return []
+        mechanisms = self._allowed_by_jurisdiction.get(jurisdiction, {})
+        return _first_compliant(self._base, request, lambda c: c in mechanisms)[1:]
+
+    def record_usage(
+        self, principal: Principal, model: str, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        self._base.record_usage(principal, model, prompt_tokens, completion_tokens)
+
+
+class RetentionPolicy(ModelPolicy):
+    """Wraps another `ModelPolicy`, keeping its routing decision unchanged
+    unless the resolved deployment's configured retention terms exceed
+    the ceiling this specific request requires — answers *how long*
+    (and, implicitly, under what terms) whoever processes this data is
+    allowed to keep it. A different question from `ResidencyPolicy`, and
+    an independent one: a deployment can be geographically compliant and
+    still retain prompts for weeks under a vendor's default
+    abuse-monitoring window, which is exactly what a zero-data-retention
+    (ZDR) agreement exists to rule out. A call can fail either check
+    without failing the other, so stack both when both matter:
+    `RetentionPolicy(ResidencyPolicy(base, ...), ...)`.
+
+    Reads the required ceiling from
+    `request.context["max_retention_days"]` — `0` means this call
+    requires a zero-data-retention deployment. Same reasoning as
+    `ResidencyPolicy`: what retention ceiling a piece of data requires is
+    a property of the data (a trade secret, a health record, anything
+    under a strict DPA), not of who's asking, so it travels in context,
+    not on the principal.
+
+    Fails closed the same way `ResidencyPolicy` does: `max_retention_days`
+    missing from context, or present but met by no candidate, both deny
+    outright. No silent fallback to a deployment whose retention terms
+    were never actually checked.
+
+    `deployment_retention_days` should reflect the *current*, actual
+    terms of your agreement with each deployment's vendor, not an
+    estimate — and needs updating when a contract is renegotiated, the
+    same discipline `ResidencyPolicy.allowed_by_jurisdiction` requires
+    for transfer mechanisms. Marshal enforces whatever this config says;
+    it has no way to confirm a vendor is actually honoring it downstream.
+    """
+
+    def __init__(self, base: ModelPolicy, deployment_retention_days: dict[str, int]) -> None:
+        self._base = base
+        self._deployment_retention_days = deployment_retention_days
+
+    def _meets_ceiling(self, name: str, max_days: int) -> bool:
+        days = self._deployment_retention_days.get(name)
+        return days is not None and days <= max_days
+
+    def resolve(self, request: ModelCallRequest) -> ModelDecision:
+        decision = self._base.resolve(request)
+        if decision.outcome != "allow":
+            return decision
+        max_days = request.context.get("max_retention_days")
+        if max_days is None:
+            return ModelDecision(
+                "deny",
+                None,
+                "max_retention_days not provided in context — refusing to resolve without it",
+            )
+        compliant = _first_compliant(self._base, request, lambda c: self._meets_ceiling(c, max_days))
+        if not compliant:
+            return ModelDecision(
+                "deny",
+                None,
+                f"no deployment for {request.logical_name!r} meets a {max_days}-day "
+                f"retention ceiling",
+            )
+        chosen = compliant[0]
+        return ModelDecision(
+            "allow",
+            chosen,
+            f"resolved {request.logical_name!r} -> {chosen!r}: retains for "
+            f"{self._deployment_retention_days[chosen]} day(s), within the {max_days}-day ceiling",
+        )
+
+    def fallback_chain(self, request: ModelCallRequest) -> list[str]:
+        max_days = request.context.get("max_retention_days")
+        if max_days is None:
+            return []
+        return _first_compliant(self._base, request, lambda c: self._meets_ceiling(c, max_days))[1:]
+
+    def record_usage(
+        self, principal: Principal, model: str, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        self._base.record_usage(principal, model, prompt_tokens, completion_tokens)
 
 
 @dataclass(frozen=True)
