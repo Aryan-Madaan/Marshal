@@ -16,8 +16,11 @@ from marshal_ai.tools import (
     ArgumentRedaction,
     AutoApprove,
     CLIApprovalHandler,
+    JurisdictionalRiskTierPolicy,
+    RateLimitPolicy,
     RedactingToolPolicy,
     RiskTierPolicy,
+    RunawayAgentPolicy,
     ToolCallDenied,
     ToolCallEntry,
     ToolCallRequest,
@@ -53,7 +56,7 @@ from marshal_ai.sensitive import (
     SensitiveDataToolPolicy,
 )
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "AuditableEvent",
@@ -76,8 +79,11 @@ __all__ = [
     "ArgumentRedaction",
     "AutoApprove",
     "CLIApprovalHandler",
+    "JurisdictionalRiskTierPolicy",
+    "RateLimitPolicy",
     "RedactingToolPolicy",
     "RiskTierPolicy",
+    "RunawayAgentPolicy",
     "ToolCallDenied",
     "ToolCallEntry",
     "ToolCallRequest",

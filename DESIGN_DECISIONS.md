@@ -356,6 +356,71 @@ convention), checking more specific subclasses before their parents.
 Matches the same discipline the `claude-api`-style "never guess SDK
 usage" rule already applies elsewhere in this project's own tooling.
 
+## Where `RateLimitPolicy`/`RunawayAgentPolicy`/`JurisdictionalRiskTierPolicy` sit, and why
+
+**Decision point — three separate classes, not one combined "protect the
+agent" policy.** Rate limiting (call frequency), runaway-loop detection
+(call repetition), and jurisdictional oversight (risk classification) are
+three independent facts about a call, the same way residency and
+retention are two independent facts about a model deployment. Collapsing
+them into one class with three constructor arguments would repeat the
+exact anti-pattern this project has already rejected twice (Residency vs.
+Retention as `ModelGuard.py`'s `ResidencyPolicy`/`RetentionPolicy`, kept
+separate on purpose; `RiskTierPolicy` not also redacting). Composability
+over a combined config surface, consistently.
+
+**Decision point — `RunawayAgentPolicy`, not a second `CircuitBreakerPolicy`.**
+Both are "circuit breaker"-shaped in the loose sense (something trips,
+something gets denied), which is exactly the trap: `CircuitBreakerPolicy`
+trips a *model deployment* on *failure rate*; `RunawayAgentPolicy` trips
+a *principal* on *identical-call count*, and can trip on a loop that
+succeeds every single time — the two trigger conditions aren't
+substitutable, and reusing the name would suggest they were. Naming them
+apart was a deliberate choice made explicit in `ideas.md` before writing
+either the class or its tests, not discovered as a bug afterward.
+
+**Decision point — no self-healing timer for `RunawayAgentPolicy`,
+unlike `CircuitBreakerPolicy`.** A model deployment recovering from a
+transient failure and a runaway agent loop are different kinds of
+problem: the deployment's failure rate genuinely can drop on its own
+(the outage ends), but a broken termination condition doesn't fix itself
+just because a clock ran out — the bug is still there. Requiring an
+explicit `reset(principal_id)` reflects that the two failure modes need
+different recovery models, not that one class is more "finished" than
+the other.
+
+**Decision point — `RateLimitPolicy` counts every attempt, including
+ones the base policy denies.** A rate limit is answering "how often is
+this principal trying," not "how often are they succeeding" — counting
+only allowed calls would let a principal being denied for an unrelated
+reason retry indefinitely without ever tripping the rate limit, which
+defeats the backstop's actual purpose (protecting against both malicious
+abuse and an agent's own bugs, neither of which politely stops retrying
+just because the reason for denial is different from rate limiting).
+
+**Decision point — `JurisdictionalRiskTierPolicy` is monotonic, and has
+no fail-closed default.** Two asymmetric choices, both deliberate.
+Monotonic (can only tighten a base decision, never loosen it) for the
+same non-bypassable-fallback reason `AllowlistModelPolicy.fallback_chain`
+already establishes: a jurisdiction overlay must never be usable to
+argue a stricter base policy down to something more permissive. No
+fail-closed default when jurisdiction is absent — unlike `ResidencyPolicy`,
+where a missing jurisdiction always denies, because a cross-border
+transfer is *always* either lawful or not, but AI-Act-style
+classification may genuinely not apply at all outside a jurisdiction
+that regulates it; treating "no jurisdiction context" as automatically
+high-risk would manufacture oversight requirements the law never
+actually imposed.
+
+**Decision point — added `context` to `ToolCallRequest`, not a
+`ToolCallRequest`-specific mechanism.** `ModelCallRequest.context`
+already existed for exactly this purpose (jurisdiction, in
+`ResidencyPolicy`/`RetentionPolicy`). Rather than inventing a
+tool-call-specific way to pass "extra facts about this call that aren't
+part of the principal's identity," `ToolCallRequest` grew the identical
+field, and `ToolGuard.call()` grew the identical `context=` parameter
+`ModelGuard.resolve()` already has. One concept, one shape, two guards.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the

@@ -215,6 +215,39 @@ that name was never usable; see the README for the full explanation.
   below rather than rushing a bigger, riskier change to the wrapper's
   return-value contract into the same pass.
 
+- **v0.9 — `RateLimitPolicy` + `RunawayAgentPolicy` + `JurisdictionalRiskTierPolicy`:
+  three `ToolGuard`-side governance questions v0.8 didn't cover.**
+  `RateLimitPolicy` caps *how often* a principal can call anything, period
+  — every attempt counts toward the limit, including ones a base policy
+  would deny anyway, since a rate limit is about attempt frequency, not
+  success rate. `RunawayAgentPolicy` catches a different failure mode
+  entirely: a principal stuck in a broken loop calling the *same* tool
+  with the *same* arguments over and over — high frequency isn't the
+  tell (a busy, healthy agent can be just as fast), *repetition* is.
+  Deliberately named apart from `CircuitBreakerPolicy` (`marshal_ai.
+  models`) despite both being "circuit breaker"-shaped: that one trips a
+  *deployment* on *failure rate*; this one trips a *principal* on
+  *identical-call count*, and can trip on a loop that's "succeeding"
+  every time. It also deliberately does **not** self-heal on a timer —
+  once tripped, a principal stays denied until `reset(principal_id)` is
+  called explicitly, because a runaway loop doesn't stop being a bug
+  once a window elapses; that requires an actual human decision that
+  it's fixed. Shipped with only the identical-call trigger — a parallel
+  N-failed-calls trigger was considered and deliberately deferred (see
+  backlog) since it needs outcome-reporting plumbing `ToolGuard` doesn't
+  have yet. `JurisdictionalRiskTierPolicy` answers a third, unrelated
+  question: whether a specific action needs *more* human oversight in a
+  given jurisdiction than the base policy already requires (the EU AI
+  Act's Annex III high-risk categories being the sharpest example) —
+  reads jurisdiction from a new `ToolCallRequest.context` field (added
+  this release, mirroring `ModelCallRequest.context`) and is strictly
+  monotonic: it can only tighten a base decision (`allow` →
+  `require_approval` or `deny`), never loosen one, so it can never be
+  used to bypass a base policy's stricter judgment. All three reuse the
+  existing per-principal sliding-window tracking shape `BudgetPolicy`
+  established, applied to three different trigger conditions rather than
+  three unrelated mechanisms.
+
 This is also the first concrete step toward the "is Marshal becoming a
 platform" question raised alongside this work: a platform (vs. a library)
 is a system that learns from what actually happened and feeds it back into
@@ -249,38 +282,6 @@ keeping each surface's scope maximally narrow.
   caller that iterates the stream itself. Deserves its own dedicated pass
   and review, not folding into the same release that shipped non-streaming
   reliability tracking.
-
-- **Jurisdiction-aware risk tiering for `ToolGuard` (AI-specific regulation,
-  not data-transfer law).** `ResidencyPolicy`/`RetentionPolicy` (v0.7) answer
-  "where can this data go" and "how long can it be kept there" — both
-  data-protection questions. A genuinely different regulatory category
-  sits on top of that: AI-specific regulation like the EU AI Act, which
-  doesn't ask where data goes, it asks whether *this specific action*
-  requires mandatory human oversight before it happens, based on a risk
-  classification (Annex III's high-risk categories — employment,
-  creditworthiness, and others). Marshal already has the right-shaped
-  primitives for this — `RiskTierPolicy`'s allow/deny/require_approval
-  outcome *is* the "mandatory human oversight" mechanism, and the shared
-  `AuditSink` is the "automatic logging for traceability" Article 12/19
-  already require (see the reasoning already written up for this in the
-  `enterprise-intelligence.mdx` blog post). What's missing: the risk
-  *classification itself* can be jurisdiction-dependent — the same tool
-  call (an AI-assisted hiring recommendation, say) is Annex-III
-  high-risk specifically in the EU, and may carry no equivalent
-  classification in a jurisdiction with no AI-specific regulatory regime
-  yet. `RiskTierPolicy` today takes one flat tier→outcome table with no
-  jurisdiction axis. The fix is the same wrapping shape as
-  `ResidencyPolicy`, applied to `ToolPolicy` instead of `ModelPolicy`: a
-  `JurisdictionalRiskTierPolicy` that reads jurisdiction from
-  `ToolCallRequest`'s context and overrides the required outcome per
-  jurisdiction — forcing `require_approval` for an EU-governed call in an
-  Annex-III category even where the base policy would otherwise allow it
-  outright. Deliberately not folded into v0.7: it's a different
-  regulatory question living on a different guard (`ToolGuard`, not
-  `ModelGuard`), and v0.7 was already three real additions
-  (`ResidencyPolicy`, `RetentionPolicy`, and the mechanism/controller
-  tracking added to both) — worth its own release rather than further
-  scope creep on this one.
 
 - **Real vector-store integration for `RetrievalGuard`.** Everything's only ever
   been proven against a fake in-memory retriever. A real Chroma adapter (via
@@ -328,31 +329,31 @@ keeping each surface's scope maximally narrow.
   queue (not necessarily infra — could start as a local SQLite-backed one) and
   an `ApprovalHandler` that returns a future/pending state instead of blocking.
 
-- **Runaway-agent breaker (per-*principal* call frequency, not per-deployment
-  health — a different thing from `CircuitBreakerPolicy` below, name it
-  something that doesn't collide).** `BudgetPolicy` catches an agent that's
-  burned through its dollar limit — it does nothing about an agent stuck in a
-  loop calling the *same* tool or model hundreds of times in a few seconds
-  before enough usage has even been reported to trip the budget. v0.8's
-  `CircuitBreakerPolicy` doesn't cover this either: it trips a *deployment*
-  based on *failure rate*, which is exactly the wrong shape for a runaway
-  loop that's succeeding every time (a broken termination condition retrying
-  a "successful" no-op tool call isn't a reliability problem, it's a
-  behavioral one). This is a real, expensive, well-documented failure mode —
-  a wrapper (working name `RunawayAgentPolicy`, to keep it distinct from
-  `CircuitBreakerPolicy`) trips after N identical or N failed calls from one
-  *principal* within a time window and requires a human reset, independent
-  of and faster-tripping than dollar-based budgets. Natural pairing with
-  rate limiting (below) — probably one policy wrapper, two trigger
-  conditions.
+- **`RunawayAgentPolicy`'s N-failed-calls trigger.** v0.9 shipped the
+  identical-call trigger only (see Shipped below) — a parallel "N *failed*
+  calls from one principal" trigger was considered too, but it needs
+  `ToolGuard` to report call outcomes the way `ModelGuard.record_outcome`
+  does for model calls, and that plumbing doesn't exist for tool calls
+  yet (today, if the wrapped tool itself raises inside `ToolGuard.call()`,
+  the exception just propagates — nothing observes or audits it, the same
+  shape of gap `ModelGuard` had before v0.8). Worth its own pass: adding
+  `ToolPolicy.record_outcome` and wiring `ToolGuard.call()` to report
+  success/failure around the actual `self._tool(**arguments)` invocation
+  is a real, separate piece of work, not a one-line addition to
+  `RunawayAgentPolicy`.
 
-- **Rate limiting per principal.** Neither `ToolGuard` nor `ModelGuard` cap
-  *how often* a principal can call something, only whether a given call is
-  allowed. A token-bucket `RateLimitPolicy` (thread-safe, same shape as
-  `BudgetPolicy`'s `_spent` tracking) wrapping a base policy would deny once
-  a principal exceeds N calls per window — a cheap, deterministic backstop
-  against both malicious abuse and an agent's own bugs, complementary to
-  (not a replacement for) the circuit breaker above.
+- **Rate limiting / runaway-loop detection for `ModelGuard`, not just
+  `ToolGuard`.** v0.9's `RateLimitPolicy`/`RunawayAgentPolicy` wrap
+  `ToolPolicy` specifically — tool calls being the more expensive/
+  consequential axis (actions, not just routing). An agent can just as
+  easily loop on *model* calls (retrying the same prompt against the same
+  model hundreds of times), and the same sliding-window mechanism applies
+  cleanly to `ModelPolicy` too. Not built alongside v0.9 because Python's
+  `ToolPolicy`/`ModelPolicy` are separate ABCs with separate request/
+  decision shapes — a literal shared class isn't possible without
+  awkward multiple inheritance, so this would be a second, `ModelPolicy`-
+  side class (distinctly named, e.g. `ModelRateLimitPolicy`), not a
+  one-line reuse of the `ToolGuard` version.
 
 - **Policy-as-config (YAML/JSON).** Every policy today is a Python object,
   which means a compliance reviewer who isn't a Python engineer can't audit

@@ -1,9 +1,9 @@
 # Marshal
 
-Governance for AI systems: permission-aware retrieval, tool-call approval,
-model routing with budgets, cross-border data-residency/retention control,
-and reliability-aware circuit breaking, with one audit trail across all
-three.
+Governance for AI systems: permission-aware retrieval, tool-call approval
+with rate limiting and jurisdiction-aware risk tiering, model routing with
+budgets, cross-border data-residency/retention control, and
+reliability-aware circuit breaking, with one audit trail across all three.
 
 **[See the landing page →](https://aryan-madaan.github.io/Marshal/)** — the
 pitch, a live checkpoint demo, and the code, in two minutes.
@@ -34,7 +34,8 @@ Three governance surfaces, one shared audit trail:
 - **`RetrievalGuard`** — wraps any retriever with document/field-level
   access control.
 - **`ToolGuard`** — wraps any callable tool with risk-tiered
-  allow/deny/require-approval and argument redaction.
+  allow/deny/require-approval, argument redaction, per-principal rate
+  limiting, runaway-loop detection, and jurisdiction-aware oversight.
 - **`ModelGuard`** — resolves a logical model name to a real one per
   principal, with governed fallback chains and per-principal budget
   enforcement. Doesn't make the call for you — resolve, call it yourself,
@@ -136,6 +137,41 @@ guard.call(hr, {"employee_id": "E123", "salary_band": "L6"}, risk_tier="medium")
 ```
 
 Run `python examples/tool_governance_example.py` for a fuller walkthrough.
+
+## Quickstart: agent reliability (rate limits, runaway loops, jurisdiction)
+
+```python
+from marshal_ai import (
+    JurisdictionalRiskTierPolicy, Principal, RateLimitPolicy,
+    RiskTierPolicy, RunawayAgentPolicy, ToolGuard,
+)
+
+# caps call frequency, period — regardless of what any individual call resolves to
+rate_limited = RateLimitPolicy(RiskTierPolicy({"low": "allow"}), max_calls=100, window_seconds=60)
+
+# catches a broken retry loop: same tool, same arguments, over and over —
+# requires a human reset(), doesn't self-heal like CircuitBreakerPolicy does
+loop_guard = RunawayAgentPolicy(rate_limited, identical_call_threshold=5, window_seconds=10)
+
+# same action, more oversight in a specific jurisdiction — never less
+policy = JurisdictionalRiskTierPolicy(
+    loop_guard, overrides_by_jurisdiction={"EU": {"employment_decision": "require_approval"}}
+)
+guard = ToolGuard(tool=my_tool, policy=policy)
+
+alice = Principal(id="alice")
+guard.call(alice, {...}, risk_tier="employment_decision", context={"jurisdiction": "EU"})
+# forced through approval in the EU even if the base policy would allow it outright;
+# an identical call repeated 5+ times in 10s trips loop_guard until a human calls
+# loop_guard.reset(alice.id); everything above still counts toward rate_limited's cap
+```
+
+Three independent questions, stacked: *how often* (rate limit), *is this a
+loop* (runaway-agent — a repetition problem, not a frequency one: a busy
+but healthy agent can be just as fast), and *does this jurisdiction demand
+more oversight* (jurisdictional risk tiering — monotonic, can only add
+approval requirements, never remove one the base policy already set).
+Run `python examples/agent_reliability_example.py` for all three together.
 
 ## Quickstart: model governance
 
@@ -372,6 +408,25 @@ shared audit trail.
   the v0.1 "actually runnable today" path) and `AutoApprove` (tests/dev
   only). Implement your own for a Slack button or a web queue.
 - A denied or declined call raises `ToolCallDenied` — never a silent no-op.
+- **`RateLimitPolicy`** — wraps another `ToolPolicy`; denies once a
+  principal exceeds `max_calls` within a trailing `window_seconds`. Every
+  attempt counts, including ones the base policy would deny anyway.
+- **`RunawayAgentPolicy`** — wraps another `ToolPolicy`; trips a
+  *principal* (not a tool, not a deployment) once they've made
+  `identical_call_threshold` calls to the same tool with the same
+  arguments in `window_seconds` — the "stuck in a broken retry loop"
+  failure mode a rate limit alone can't distinguish from a busy, healthy
+  agent. Deliberately does **not** self-heal on a timer: stays tripped
+  until `reset(principal_id)` is called explicitly.
+- **`JurisdictionalRiskTierPolicy`** — wraps another `ToolPolicy`; reads
+  jurisdiction from `request.context["jurisdiction"]` and can force a
+  *stricter* outcome (e.g. `require_approval`) for a specific risk tier
+  in that jurisdiction — monotonic, it can only tighten a base policy's
+  decision, never loosen one.
+- `ToolCallRequest.context` mirrors `ModelCallRequest.context` — free-form,
+  policy-interpreted, and how jurisdiction reaches `ToolGuard.call(...,
+  context={"jurisdiction": "EU"})` the same way it already reaches
+  `ModelGuard.resolve(..., context=...)`.
 
 ### Model calls (`ModelGuard`)
 
@@ -540,18 +595,20 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.8 — all three governance surfaces (retrieval, tool calls, model
-routing/budgets/cross-border data residency/data retention/reliability-
-aware circuit breaking), one shared audit trail, OpenTelemetry export, a
-local CLI viewer, one-line model governance for any OpenAI/Anthropic-based
-framework via SDK patching (now with automatic outcome/latency reporting),
-and deterministic sensitive-data detection across every surface. Real
-Chroma integration for `RetrievalGuard` is still in progress — see
-[`ideas.md`](./ideas.md) for that and what's next beyond it (time-to-
-first-token tracking for streaming calls; jurisdiction-aware risk tiering
-for AI-specific regulation like the EU AI Act; a litellm proxy hook for
-deployments already running the LiteLLM proxy; framework-specific
-tool-call adapters).
+v0.9 — all three governance surfaces (retrieval; tool calls with rate
+limiting, runaway-loop detection, and jurisdiction-aware risk tiering;
+model routing/budgets/cross-border data residency/data retention/
+reliability-aware circuit breaking), one shared audit trail, OpenTelemetry
+export, a local CLI viewer, one-line model governance for any
+OpenAI/Anthropic-based framework via SDK patching (with automatic
+outcome/latency reporting), and deterministic sensitive-data detection
+across every surface. Real Chroma integration for `RetrievalGuard` is
+still in progress — see [`ideas.md`](./ideas.md) for that and what's next
+beyond it (time-to-first-token tracking for streaming calls; an N-failed-
+calls trigger for `RunawayAgentPolicy` once `ToolGuard` reports call
+outcomes the way `ModelGuard` does; a litellm proxy hook for deployments
+already running the LiteLLM proxy; framework-specific tool-call adapters;
+policy-as-config).
 
 ## License
 

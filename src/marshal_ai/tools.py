@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
@@ -13,12 +14,16 @@ from marshal_ai.policy import Principal
 class ToolCallRequest:
     """One agent's attempt to call one tool. `risk_tier` is assigned by the
     caller (you decide what "high risk" means for your tools) — policies
-    decide what to *do* with that tier."""
+    decide what to *do* with that tier. `context` mirrors
+    `ModelCallRequest.context` — free-form, policy-interpreted extra
+    facts about this specific call (e.g. jurisdiction) that don't belong
+    on the principal's own identity."""
 
     tool_name: str
     arguments: dict[str, Any]
     principal: Principal
     risk_tier: str = "low"
+    context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,73 @@ class RiskTierPolicy(ToolPolicy):
         return ToolDecision(outcome, reason)
 
 
+_OUTCOME_SEVERITY = {"allow": 0, "require_approval": 1, "deny": 2}
+
+
+class JurisdictionalRiskTierPolicy(ToolPolicy):
+    """Wraps another `ToolPolicy`, keeping its decision unchanged unless
+    the request's jurisdiction requires *more* oversight than the base
+    policy already gives it — answers a different question from
+    `ResidencyPolicy`/`RetentionPolicy` (`marshal_ai.models`): not "where
+    can this data go" or "how long can it be kept," but "does this
+    specific *action* require mandatory human oversight before it
+    happens, given a risk classification that can itself vary by
+    jurisdiction" — the EU AI Act's Annex III high-risk categories
+    (employment, creditworthiness, and others) being the sharpest
+    example: the same tool call can be Annex-III high-risk specifically
+    in the EU and carry no equivalent classification elsewhere.
+
+    Reads jurisdiction from `request.context["jurisdiction"]` — same
+    context-not-principal-attribute reasoning as `ResidencyPolicy`: which
+    regulatory regime applies is a property of whose data/decision this
+    call concerns, not of who's making it. If jurisdiction is absent,
+    this policy is a no-op and defers entirely to the base — unlike
+    `ResidencyPolicy`, there's no fail-closed default here, since AI-Act-
+    style classification (unlike a cross-border transfer) genuinely may
+    not apply at all outside a jurisdiction that regulates it.
+
+    `overrides_by_jurisdiction` maps jurisdiction -> {risk_tier: outcome}.
+    The override is **monotonic — it can only tighten, never loosen**: if
+    the base policy already resolved to something at least as strict
+    (`deny` > `require_approval` > `allow`), the override is ignored and
+    the base's own decision (and reason) passes through unchanged. This
+    can never be used to bypass a base policy's stricter judgment, only
+    to add oversight a jurisdiction-blind base policy wouldn't have
+    known to require — the same non-bypassable-fallback principle
+    `AllowlistModelPolicy.fallback_chain` already establishes elsewhere.
+    """
+
+    def __init__(self, base: ToolPolicy, overrides_by_jurisdiction: dict[str, dict[str, str]]) -> None:
+        for jurisdiction, tiers in overrides_by_jurisdiction.items():
+            for tier, outcome in tiers.items():
+                if outcome not in _OUTCOME_SEVERITY:
+                    raise ValueError(
+                        f"invalid outcome {outcome!r} for jurisdiction {jurisdiction!r}, "
+                        f"tier {tier!r}; must be one of {sorted(_OUTCOME_SEVERITY)}"
+                    )
+        self._base = base
+        self._overrides = overrides_by_jurisdiction
+
+    def evaluate(self, request: ToolCallRequest) -> ToolDecision:
+        base_decision = self._base.evaluate(request)
+        jurisdiction = request.context.get("jurisdiction")
+        if jurisdiction is None:
+            return base_decision
+        override_outcome = self._overrides.get(jurisdiction, {}).get(request.risk_tier)
+        if override_outcome is None:
+            return base_decision
+        if _OUTCOME_SEVERITY[override_outcome] <= _OUTCOME_SEVERITY[base_decision.outcome]:
+            return base_decision
+        return ToolDecision(
+            override_outcome,
+            f"jurisdiction {jurisdiction!r} requires {override_outcome!r} for risk tier "
+            f"{request.risk_tier!r} (base policy would have allowed {base_decision.outcome!r})",
+        )
+
+    def redact_arguments(self, request: ToolCallRequest) -> dict[str, Any]:
+        return self._base.redact_arguments(request)
+
+
 @dataclass(frozen=True)
 class ArgumentRedaction:
     """A rule for RedactingToolPolicy: hide argument `name` in the audit
@@ -130,6 +202,149 @@ class RedactingToolPolicy(ToolPolicy):
             if rule.name in arguments:
                 arguments[rule.name] = rule.replacement
         return arguments
+
+
+class RateLimitPolicy(ToolPolicy):
+    """Wraps another `ToolPolicy`, keeping its decision unchanged unless a
+    principal has made more than `max_calls` calls (of any kind, to any
+    tool, allowed or not) within the trailing `window_seconds` — a cheap,
+    deterministic backstop against both abuse and an agent's own bugs,
+    independent of whether any individual call would otherwise be allowed.
+
+    Every call to `evaluate()` counts toward the limit, including ones the
+    base policy would deny anyway — a rate limit caps *how often* a
+    principal is attempting something, not just how often they succeed.
+    Denies outright once the limit is exceeded; does not touch
+    `redact_arguments`, which always defers to the base policy.
+    """
+
+    def __init__(self, base: ToolPolicy, max_calls: int, window_seconds: float) -> None:
+        self._base = base
+        self._max_calls = max_calls
+        self._window_seconds = window_seconds
+        self._calls: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def _record_and_count(self, principal_id: str) -> int:
+        now = time.monotonic()
+        cutoff = now - self._window_seconds
+        with self._lock:
+            recent = [t for t in self._calls.get(principal_id, []) if t >= cutoff]
+            recent.append(now)
+            self._calls[principal_id] = recent
+            return len(recent)
+
+    def evaluate(self, request: ToolCallRequest) -> ToolDecision:
+        count = self._record_and_count(request.principal.id)
+        if count > self._max_calls:
+            return ToolDecision(
+                "deny",
+                f"rate limit exceeded for {request.principal.id!r}: {count} calls "
+                f"within the last {self._window_seconds:.0f}s (limit {self._max_calls})",
+            )
+        return self._base.evaluate(request)
+
+    def redact_arguments(self, request: ToolCallRequest) -> dict[str, Any]:
+        return self._base.redact_arguments(request)
+
+
+class RunawayAgentPolicy(ToolPolicy):
+    """Wraps another `ToolPolicy`; trips a specific *principal* — not a
+    tool, not a deployment — once they've made `identical_call_threshold`
+    calls to the *same* tool with the *same* arguments within
+    `window_seconds`. Catches the failure mode `RateLimitPolicy` and
+    `BudgetPolicy` both miss: an agent stuck in a broken retry loop,
+    calling one tool with one fixed set of arguments hundreds of times in
+    a few seconds — high frequency isn't the tell (a legitimately busy
+    agent can be just as fast), *repetition* is.
+
+    Deliberately named differently from `CircuitBreakerPolicy`
+    (`marshal_ai.models`), which trips a *model deployment* based on
+    *failure rate* — a different axis entirely (a runaway loop can be
+    "succeeding" on every identical call and still be exactly the bug this
+    class exists to catch).
+
+    Deliberately does **not** self-heal on a timer the way
+    `CircuitBreakerPolicy` does. A loop that's already run away doesn't
+    stop being a bug once a time window elapses — once tripped, a
+    principal stays denied until `reset(principal_id)` is called
+    explicitly, matching the backlog's own framing: this requires a human
+    decision that the loop is actually fixed, not a timeout guessing that
+    it might be.
+
+    Scope, stated plainly: only the identical-call trigger is implemented
+    here. A parallel "N *failed* calls" trigger was also considered, but
+    it needs `ToolGuard` to report call outcomes the way `ModelGuard.
+    record_outcome` does — that plumbing doesn't exist yet for tool calls,
+    so it's tracked as a named follow-up in `ideas.md` rather than
+    bundled into this class before the mechanism it would depend on
+    exists.
+    """
+
+    def __init__(
+        self, base: ToolPolicy, identical_call_threshold: int, window_seconds: float
+    ) -> None:
+        self._base = base
+        self._identical_call_threshold = identical_call_threshold
+        self._window_seconds = window_seconds
+        self._recent_calls: dict[str, list[tuple[float, str, dict[str, Any]]]] = {}
+        self._tripped: set[str] = set()
+        self._lock = threading.Lock()
+
+    def _identical_count(self, request: ToolCallRequest) -> int:
+        now = time.monotonic()
+        cutoff = now - self._window_seconds
+        with self._lock:
+            recent = [
+                (t, name, args)
+                for t, name, args in self._recent_calls.get(request.principal.id, [])
+                if t >= cutoff
+            ]
+            recent.append((now, request.tool_name, request.arguments))
+            self._recent_calls[request.principal.id] = recent
+            return sum(
+                1
+                for _, name, args in recent
+                if name == request.tool_name and args == request.arguments
+            )
+
+    def evaluate(self, request: ToolCallRequest) -> ToolDecision:
+        principal_id = request.principal.id
+        with self._lock:
+            already_tripped = principal_id in self._tripped
+        if already_tripped:
+            return ToolDecision(
+                "deny",
+                f"runaway-agent breaker tripped for {principal_id!r} — "
+                f"requires a human reset() before this principal can call anything again",
+            )
+
+        count = self._identical_count(request)
+        if count >= self._identical_call_threshold:
+            with self._lock:
+                self._tripped.add(principal_id)
+            return ToolDecision(
+                "deny",
+                f"runaway-agent breaker tripped for {principal_id!r}: {count} identical "
+                f"calls to {request.tool_name!r} within {self._window_seconds:.0f}s "
+                f"(threshold {self._identical_call_threshold}) — requires a human reset()",
+            )
+        return self._base.evaluate(request)
+
+    def redact_arguments(self, request: ToolCallRequest) -> dict[str, Any]:
+        return self._base.redact_arguments(request)
+
+    def reset(self, principal_id: str) -> None:
+        """Clear a tripped principal so they can call tools again — the
+        explicit human decision this class requires instead of a timeout.
+        A no-op if that principal was never tripped."""
+        with self._lock:
+            self._tripped.discard(principal_id)
+            self._recent_calls.pop(principal_id, None)
+
+    def is_tripped(self, principal_id: str) -> bool:
+        with self._lock:
+            return principal_id in self._tripped
 
 
 class ApprovalHandler(ABC):
@@ -263,6 +478,7 @@ class ToolGuard:
         principal: Principal,
         arguments: dict[str, Any],
         risk_tier: str = "low",
+        context: Optional[dict[str, Any]] = None,
     ) -> Any:
         """Evaluate policy, redact for the audit trail, get approval if
         required, log the outcome, and — only if allowed — actually call
@@ -276,6 +492,7 @@ class ToolGuard:
             arguments=arguments,
             principal=principal,
             risk_tier=risk_tier,
+            context=context or {},
         )
         decision = self._policy.evaluate(request)
         redacted = self._policy.redact_arguments(request)
