@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
 from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
-from marshal_ai.policy import Principal
+from marshal_ai.policy import GuardMode, Principal
 
 
 @dataclass(frozen=True)
@@ -572,12 +572,24 @@ class CircuitBreakerPolicy(ModelPolicy):
 
 @dataclass(frozen=True)
 class ModelCallEntry:
+    """`resolved_model` is `None` only for a real (enforced) denial —
+    `outcome == "deny"` and `shadow == False`. A shadow-mode denial keeps
+    `outcome == "deny"` (the real policy's decision, audited verbatim,
+    the same reuse-the-vocabulary approach `ToolCallEntry.outcome` uses)
+    but `resolved_model` is still populated with whatever `ModelGuard`
+    handed back to the caller instead of raising — see
+    `ModelGuard._shadow_fallback_model`. Because `outcome` keeps its
+    enforce-mode meaning, a shadow "deny" entry still shows up under
+    `AuditSink.query(denied_only=True)` for free.
+    """
+
     timestamp: float
     principal_id: str
     logical_name: str
     resolved_model: Optional[str]
     outcome: str  # "allow" | "deny"
     reason: str
+    shadow: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "model_call", **asdict(self)}
@@ -635,19 +647,47 @@ class ModelGuard:
     """Resolves logical model names through a policy, audits every
     resolution, and forwards usage reports for budget tracking — sharing
     the same `AuditSink` as `RetrievalGuard`/`ToolGuard` if you pass one
-    in, for one trail across every surface."""
+    in, for one trail across every surface.
+
+    `mode="enforce"` (the default) is today's behavior unchanged: a
+    denied resolution raises `ModelCallDenied`. `mode="shadow"` still
+    resolves and audits the real decision, but never raises — see
+    `resolve` below for what it returns instead of raising.
+    """
 
     def __init__(
         self,
         policy: Optional[ModelPolicy] = None,
         audit_sink: Optional[AuditSink] = None,
+        mode: GuardMode = "enforce",
     ) -> None:
         self._policy = policy if policy is not None else AllowAllModels()
         self._audit_sink = audit_sink if audit_sink is not None else InMemoryAuditSink()
+        self._mode = mode
 
     @property
     def audit_log(self) -> AuditSink:
         return self._audit_sink
+
+    def _shadow_fallback_model(self, request: ModelCallRequest) -> str:
+        """What shadow mode hands back when the real policy would have
+        denied `request` — `resolve()` must always return a usable model
+        name in shadow mode, never `None`, the same way a caller expects
+        a real answer in enforce mode.
+
+        Prefers the policy's own `fallback_chain()`, which can be
+        non-empty even under a denial — e.g. `BudgetPolicy.fallback_chain`
+        forwards to its base regardless of spend (see `BudgetPolicy`
+        above), so an over-budget principal still gets back a real,
+        already-qualifying candidate rather than nothing. Falls back to
+        the bare logical name itself only when the policy has genuinely
+        nothing configured for it — the same last-resort behavior
+        `AllowAllModels` already uses when there's no routing at all.
+        """
+        chain = self._policy.fallback_chain(request)
+        if chain:
+            return chain[0]
+        return request.logical_name
 
     def resolve(
         self, principal: Principal, logical_name: str, context: Optional[dict[str, Any]] = None
@@ -655,22 +695,36 @@ class ModelGuard:
         """Resolve `logical_name` to a real model name for `principal`.
         Raises `ModelCallDenied` if no candidate qualifies. Make your real
         LLM call with the returned name, using whatever client you
-        already have — Marshal doesn't wrap the call itself."""
+        already have — Marshal doesn't wrap the call itself.
+
+        In shadow mode, never raises: a denial is still computed and
+        audited (see `ModelCallEntry`), but this returns a sensible model
+        anyway (the policy's own governed fallback if one exists,
+        otherwise `logical_name` itself) so the caller's code keeps
+        working exactly as if governance weren't wired in yet.
+        """
         request = ModelCallRequest(logical_name, principal, context or {})
         decision = self._policy.resolve(request)
+        shadow = self._mode == "shadow"
+
+        resolved_model = decision.resolved_model
+        if shadow and decision.outcome != "allow":
+            resolved_model = self._shadow_fallback_model(request)
+
         self._audit_sink.write(
             ModelCallEntry(
                 timestamp=time.time(),
                 principal_id=principal.id,
                 logical_name=logical_name,
-                resolved_model=decision.resolved_model,
+                resolved_model=resolved_model,
                 outcome=decision.outcome,
                 reason=decision.reason,
+                shadow=shadow,
             )
         )
-        if decision.outcome == "deny":
+        if decision.outcome == "deny" and not shadow:
             raise ModelCallDenied(logical_name, decision.reason)
-        return decision.resolved_model  # type: ignore[return-value]
+        return resolved_model  # type: ignore[return-value]
 
     def fallback_chain(
         self, principal: Principal, logical_name: str, context: Optional[dict[str, Any]] = None

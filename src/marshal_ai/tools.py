@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
-from marshal_ai.policy import Principal
+from marshal_ai.policy import GuardMode, Principal
 
 
 @dataclass(frozen=True)
@@ -398,21 +398,51 @@ class AutoApprove(ApprovalHandler):
         return self._approve
 
 
+def _redacted_argument_names(raw: dict[str, Any], redacted: dict[str, Any]) -> list[str]:
+    """Which argument keys `ToolPolicy.redact_arguments()` actually
+    changed relative to the real, raw arguments — names only, never the
+    raw or redacted values, so this is safe to audit even in shadow mode
+    without leaking what a redaction rule would have hidden.
+    """
+    return sorted(key for key, value in raw.items() if redacted.get(key, value) != value)
+
+
 @dataclass(frozen=True)
 class ToolCallEntry:
     """A record of one tool-call attempt. `arguments` here are always the
     *redacted* view — see `ToolPolicy.redact_arguments` — never the raw
     ones, so the audit log itself can't leak what a redaction rule was
-    meant to hide."""
+    meant to hide.
+
+    `shadow` — True when this entry was written by a `ToolGuard` running
+    in shadow mode: `outcome`/`reason` below are still the real policy's
+    decision, computed and audited exactly as in enforce mode, but never
+    acted on — the wrapped tool was called regardless of what `outcome`
+    says, and no approval was ever requested even when `outcome` is
+    `"require_approval"` (a value only ever seen on shadow entries;
+    enforce mode always resolves it to `"approved"`/`"declined"` first).
+    Because `outcome` keeps its enforce-mode vocabulary, a shadow "deny"
+    entry still shows up under `AuditSink.query(denied_only=True)` and
+    the CLI's `!` flag for free — exactly what shadow mode exists to
+    surface, with no changes needed to either consumer.
+
+    `would_redact_fields` — argument key names `redact_arguments()`
+    would change relative to the real arguments, regardless of mode —
+    names only, never values, so a reader can see *what* a redaction
+    rule targets without the audit trail itself becoming a second copy
+    of what it's meant to hide.
+    """
 
     timestamp: float
     principal_id: str
     tool_name: str
     arguments: dict[str, Any]
     risk_tier: str
-    outcome: str  # "allow" | "deny" | "approved" | "declined"
+    outcome: str  # "allow" | "deny" | "approved" | "declined" | "require_approval" (shadow only)
     reason: str
     approved_by: Optional[str] = None
+    shadow: bool = False
+    would_redact_fields: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "tool_call", **asdict(self)}
@@ -430,6 +460,13 @@ class ToolGuard:
     entry written to the same kind of `AuditSink` `RetrievalGuard` uses —
     share one sink between guards and `sink.query(...)` covers both
     surfaces in one place.
+
+    `mode="enforce"` (the default) is today's behavior unchanged: a deny
+    raises, a require-approval decision blocks on the approval handler.
+    `mode="shadow"` still evaluates the policy and writes the identical
+    audit entry, but never raises and never requests approval — the
+    wrapped tool is always called with the real arguments, letting a team
+    see what governance *would* have blocked before turning enforcement on.
     """
 
     def __init__(
@@ -439,6 +476,7 @@ class ToolGuard:
         audit_sink: Optional[AuditSink] = None,
         approval_handler: Optional[ApprovalHandler] = None,
         tool_name: Optional[str] = None,
+        mode: GuardMode = "enforce",
     ) -> None:
         self._tool = tool
         self._policy = policy if policy is not None else AllowAllTools()
@@ -447,6 +485,7 @@ class ToolGuard:
             approval_handler if approval_handler is not None else CLIApprovalHandler()
         )
         self._tool_name = tool_name or getattr(tool, "__name__", "tool")
+        self._mode = mode
 
     @property
     def audit_log(self) -> AuditSink:
@@ -459,6 +498,8 @@ class ToolGuard:
         outcome: str,
         reason: str,
         approved_by: Optional[str],
+        shadow: bool = False,
+        would_redact_fields: Optional[list[str]] = None,
     ) -> None:
         self._audit_sink.write(
             ToolCallEntry(
@@ -470,6 +511,8 @@ class ToolGuard:
                 outcome=outcome,
                 reason=reason,
                 approved_by=approved_by,
+                shadow=shadow,
+                would_redact_fields=would_redact_fields or [],
             )
         )
 
@@ -485,7 +528,10 @@ class ToolGuard:
         the wrapped tool with the real (unredacted) arguments.
 
         Raises `ToolCallDenied` if the policy denies outright, or if a
-        required approval is declined.
+        required approval is declined — unless this guard is in shadow
+        mode (see the class docstring), in which case the decision is
+        still computed and audited but never enforced: this never raises,
+        never requests approval, and always calls the wrapped tool.
         """
         request = ToolCallRequest(
             tool_name=self._tool_name,
@@ -496,20 +542,49 @@ class ToolGuard:
         )
         decision = self._policy.evaluate(request)
         redacted = self._policy.redact_arguments(request)
+        would_redact_fields = _redacted_argument_names(request.arguments, redacted)
+
+        if self._mode == "shadow":
+            # decision.outcome is audited verbatim ("allow"/"deny"/
+            # "require_approval") — the real policy's raw answer, not
+            # translated into "approved"/"declined" the way enforce mode
+            # does, since no approval flow ever runs here.
+            self._audit(
+                request,
+                redacted,
+                decision.outcome,
+                decision.reason,
+                approved_by=None,
+                shadow=True,
+                would_redact_fields=would_redact_fields,
+            )
+            return self._tool(**arguments)
 
         if decision.outcome == "deny":
-            self._audit(request, redacted, "deny", decision.reason, approved_by=None)
+            self._audit(
+                request, redacted, "deny", decision.reason, approved_by=None,
+                would_redact_fields=would_redact_fields,
+            )
             raise ToolCallDenied(request.tool_name, decision.reason)
 
         approved_by: Optional[str] = None
         if decision.outcome == "require_approval":
             approved = self._approval_handler.request_approval(request, redacted)
             if not approved:
-                self._audit(request, redacted, "declined", decision.reason, approved_by=None)
+                self._audit(
+                    request, redacted, "declined", decision.reason, approved_by=None,
+                    would_redact_fields=would_redact_fields,
+                )
                 raise ToolCallDenied(request.tool_name, "approval declined")
             approved_by = self._approval_handler.identity
-            self._audit(request, redacted, "approved", decision.reason, approved_by=approved_by)
+            self._audit(
+                request, redacted, "approved", decision.reason, approved_by=approved_by,
+                would_redact_fields=would_redact_fields,
+            )
         else:
-            self._audit(request, redacted, "allow", decision.reason, approved_by=None)
+            self._audit(
+                request, redacted, "allow", decision.reason, approved_by=None,
+                would_redact_fields=would_redact_fields,
+            )
 
         return self._tool(**arguments)

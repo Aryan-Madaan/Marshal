@@ -2,10 +2,21 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
 
 if TYPE_CHECKING:
     from marshal_ai.retrieval import Document
+
+
+# Shared by RetrievalGuard/ToolGuard/ModelGuard, so it lives here next to
+# Principal — the one home all three surfaces already import from without
+# depending on one another (see DESIGN_DECISIONS.md's "why policy.py is
+# its own file" note). "enforce" (the default) is today's only behavior:
+# a denial/redaction/approval-requirement actually happens. "shadow"
+# computes and audits the identical decision but never acts on it — the
+# low-friction adoption path: watch what governance *would* do in
+# production before switching anything on for real.
+GuardMode = Literal["enforce", "shadow"]
 
 
 @dataclass(frozen=True)
