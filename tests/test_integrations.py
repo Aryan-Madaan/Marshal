@@ -46,6 +46,19 @@ class FakeAnthropicResponse:
     usage: FakeAnthropicUsage
 
 
+@dataclass
+class FakeGoogleUsage:
+    prompt_token_count: int
+    candidates_token_count: int
+
+
+@dataclass
+class FakeGoogleResponse:
+    model_version: str
+    usage_metadata: FakeGoogleUsage
+    text: str = "ok"
+
+
 # --- OpenAI ------------------------------------------------------------
 
 
@@ -244,6 +257,148 @@ def test_enable_anthropic_substitutes_resolved_model_and_reports_usage(monkeypat
     assert usage_entries[0].completion_tokens == 3
 
 
+# --- Google GenAI (Gemini / ADK's default model path) ----------------------
+
+
+def test_enable_google_substitutes_resolved_model_and_reports_usage(monkeypatch):
+    from google.genai.models import Models
+
+    monkeypatch.setattr(
+        Models,
+        "generate_content",
+        lambda self, **kw: FakeGoogleResponse(
+            model_version=kw["model"], usage_metadata=FakeGoogleUsage(prompt_token_count=12, candidates_token_count=7)
+        ),
+        raising=True,
+    )
+
+    sink = InMemoryAuditSink()
+    policy = AllowlistModelPolicy({"gemini-pro": [ModelCandidate("gemini-flash")]})
+    guard = ModelGuard(policy=policy, audit_sink=sink)
+    marshal_integrations.enable_google(guard, Principal(id="alice"))
+
+    response = Models.__new__(Models).generate_content(model="gemini-pro", contents="hi")
+
+    assert response.model_version == "gemini-flash"
+    usage_entries = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_usage"]
+    assert usage_entries[0].prompt_tokens == 12
+    assert usage_entries[0].completion_tokens == 7
+
+
+def test_enable_google_denies_and_never_calls_original(monkeypatch):
+    from google.genai.models import Models
+
+    calls = []
+    monkeypatch.setattr(
+        Models, "generate_content", lambda self, **kw: calls.append(kw) or None, raising=True
+    )
+
+    policy = AllowlistModelPolicy({})  # nothing routed -> always denies
+    guard = ModelGuard(policy=policy)
+    marshal_integrations.enable_google(guard, Principal(id="alice"))
+
+    client = Models.__new__(Models)
+    with pytest.raises(ModelCallDenied):
+        client.generate_content(model="gemini-pro", contents="hi")
+
+    assert calls == []
+
+
+def test_enable_google_reports_successful_outcome_with_latency(monkeypatch):
+    from google.genai.models import Models
+
+    monkeypatch.setattr(
+        Models,
+        "generate_content",
+        lambda self, **kw: FakeGoogleResponse(
+            model_version=kw["model"], usage_metadata=FakeGoogleUsage(1, 1)
+        ),
+        raising=True,
+    )
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("gemini-flash")]}), audit_sink=sink)
+    marshal_integrations.enable_google(guard, Principal(id="alice"))
+
+    Models.__new__(Models).generate_content(model="m", contents="hi")
+
+    outcomes = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_outcome"]
+    assert outcomes[0].success is True
+    assert outcomes[0].model == "gemini-flash"
+    assert outcomes[0].latency_ms is not None
+
+
+def test_enable_google_classifies_rate_limit_and_still_reraises(monkeypatch):
+    from google.genai import errors as google_errors
+    from google.genai.models import Models
+
+    real_error = google_errors.ClientError(
+        code=429, response_json={"error": {"message": "quota exceeded", "status": "RESOURCE_EXHAUSTED"}}
+    )
+
+    def fake_generate_content(self, **kw):
+        raise real_error
+
+    monkeypatch.setattr(Models, "generate_content", fake_generate_content, raising=True)
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("gemini-flash")]}), audit_sink=sink)
+    marshal_integrations.enable_google(guard, Principal(id="alice"))
+
+    with pytest.raises(google_errors.ClientError) as exc_info:
+        Models.__new__(Models).generate_content(model="m", contents="hi")
+    assert exc_info.value is real_error
+
+    outcomes = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_outcome"]
+    assert outcomes[0].success is False
+    assert outcomes[0].error == "rate_limited"
+
+
+def test_enable_google_with_scanner_blocks_prompt_before_any_network_call(monkeypatch):
+    from google.genai.models import Models
+
+    from marshal_ai.sensitive import SensitiveDataScanner
+
+    calls = []
+    monkeypatch.setattr(
+        Models, "generate_content", lambda self, **kw: calls.append(kw) or None, raising=True
+    )
+
+    sink = InMemoryAuditSink()
+    guard = ModelGuard(policy=AllowlistModelPolicy({"m": [ModelCandidate("gemini-flash")]}), audit_sink=sink)
+    marshal_integrations.enable_google(guard, Principal(id="alice"), scanner=SensitiveDataScanner())
+
+    with pytest.raises(ModelCallDenied):
+        Models.__new__(Models).generate_content(
+            model="m", contents="here's my key: sk-ant-abcdefghijklmnopqrstuvwx012345"
+        )
+
+    assert calls == []  # blocked before the real call ever happened
+
+
+def test_enable_google_async_path_substitutes_model_and_reports_usage(monkeypatch):
+    import asyncio
+
+    from google.genai.models import AsyncModels
+
+    async def fake_generate_content(self, **kw):
+        return FakeGoogleResponse(model_version=kw["model"], usage_metadata=FakeGoogleUsage(4, 2))
+
+    monkeypatch.setattr(AsyncModels, "generate_content", fake_generate_content, raising=True)
+
+    sink = InMemoryAuditSink()
+    policy = AllowlistModelPolicy({"gemini-pro": [ModelCandidate("gemini-flash")]})
+    guard = ModelGuard(policy=policy, audit_sink=sink)
+    marshal_integrations.enable_google(guard, Principal(id="alice"))
+
+    client = AsyncModels.__new__(AsyncModels)
+    response = asyncio.run(client.generate_content(model="gemini-pro", contents="hi"))
+
+    assert response.model_version == "gemini-flash"
+    usage_entries = [e for e in sink.tail(5) if e.to_dict()["kind"] == "model_usage"]
+    assert usage_entries[0].prompt_tokens == 4
+
+
 # --- principal resolution, enable()/disable_all() -------------------------
 
 
@@ -279,7 +434,7 @@ def test_principal_can_be_a_callable_for_per_request_resolution(monkeypatch):
 def test_enable_returns_names_of_what_actually_got_patched():
     guard = ModelGuard()
     patched = marshal_integrations.enable(guard, Principal(id="alice"))
-    assert set(patched) == {"openai", "anthropic"}  # both are installed in this test env
+    assert set(patched) == {"openai", "anthropic", "google"}  # all three installed in this test env
 
 
 def test_disable_all_restores_original_behavior(monkeypatch):

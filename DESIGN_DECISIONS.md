@@ -421,6 +421,48 @@ part of the principal's identity," `ToolCallRequest` grew the identical
 field, and `ToolGuard.call()` grew the identical `context=` parameter
 `ModelGuard.resolve()` already has. One concept, one shape, two guards.
 
+## Adding Google GenAI support, and correcting a wrong claim
+
+**Decision point — verify a framework-compatibility claim before trusting
+it, not after.** Asked to make Marshal easy to wrap over frameworks like
+ADK, the honest first step was checking whether the existing README claim
+("ADK... gets model governance transparently") was actually true, not
+assuming a fix was needed or that the claim already held. It wasn't true
+for ADK's default path: `LlmAgent` calls Gemini through `google-genai`
+directly, confirmed by reading ADK's own source and docs rather than
+inferring from its README prose. The same verify-don't-assume discipline
+already applied to the openai/anthropic exception hierarchy in v0.8
+applies here to a bigger claim: which SDK a framework actually calls
+under the hood isn't something to guess from a framework's marketing
+description of itself.
+
+**Decision point — prompt-text extraction became per-provider, not just
+completion-text and usage.** Through v0.9, only completion-text
+extraction and usage-field-names differed per provider; prompt scanning
+was hardcoded to read `kwargs["messages"]`. `google-genai`'s `contents=`
+kwarg has a structurally different shape (`Content`/`Part` objects, not
+role/content dicts) that a `messages`-shaped extractor can't parse at
+all — so `_PROVIDER_ADAPTERS` grew a third leg, and `_scan_prompt_or_raise`
+now takes an injected extractor instead of a hardcoded one. This is the
+same "add one entry to the table, not a new copy-pasted wrapper" shape
+the original `_make_wrapper`/`_PROVIDER_ADAPTERS` refactor from the v0.6
+SOLID audit already established — extended for a third differing
+concern, not re-invented.
+
+**Decision point — error classification branches by provider, not one
+shared check.** openai and anthropic happen to expose identically-named
+exception classes, which is what let v0.8's `_classify_error` use one
+code path for both. `google-genai` doesn't share that shape at all — no
+`RateLimitError`/`APITimeoutError` classes, just `APIError`/`ClientError`/
+`ServerError` with a `.code` HTTP status, plus raw transport exceptions
+(`httpx`/`requests`) for network-level failures that never reach the
+GenAI-specific error classes at all. Forcing one shared classifier across
+all three would have meant either silently misclassifying Google failures
+as "other" or writing speculative `isinstance` checks against class names
+that don't exist. Two classifier functions, correctly scoped to what each
+SDK actually raises, beats one classifier pretending three SDKs share a
+hierarchy they don't.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the

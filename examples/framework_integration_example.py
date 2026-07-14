@@ -1,8 +1,10 @@
-"""One-line model governance for *any* framework built on the OpenAI or
-Anthropic SDKs — LangChain, LangGraph, CrewAI, AutoGen, Google ADK (when
-configured with either provider), or a raw script. `enable()` patches the
-SDK client classes directly, so code you didn't write (inside a framework)
-gets governed transparently.
+"""One-line model governance for *any* framework built on the OpenAI,
+Anthropic, or Google GenAI SDKs — LangChain, LangGraph, CrewAI, AutoGen,
+or a raw script. `enable()` patches the SDK client classes directly, so
+code you didn't write (inside a framework) gets governed transparently.
+See `examples/adk_gemini_example.py` for the Google ADK case specifically
+— ADK's default `LlmAgent` path calls Gemini through `google-genai`
+directly, which is exactly what this patches.
 
 This example only exercises the DENY path, deliberately, so it runs with
 no API key and no network call — a real ALLOW path looks identical from

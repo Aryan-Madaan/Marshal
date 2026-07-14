@@ -260,6 +260,45 @@ but still a library: no central config store, no cross-process
 aggregation, no dashboard. Policy-as-config (below) is the other missing
 piece of that story, not this one.
 
+- **v0.10 — native Google GenAI (Gemini) support in `marshal_ai.integrations`,
+  and a corrected claim about Google ADK.** Asked directly to make Marshal
+  easy to wrap over existing providers/frameworks, specifically naming
+  ADK — checked rather than assumed, and the README's existing claim that
+  ADK "gets model governance transparently" via the openai/anthropic SDK
+  patch was **wrong** for ADK's default, most common path: `LlmAgent`
+  calls Gemini through `google-genai`'s `Models.generate_content`
+  directly, not through the `openai`/`anthropic` client classes Marshal
+  patched through v0.9 — confirmed against ADK's own source and docs,
+  not guessed. (ADK's `LiteLlm(model="openai/...")`/`LiteLlm(model=
+  "anthropic/...")` path was fine — LiteLLM genuinely does call through
+  to the real `openai`/`anthropic` SDK client classes, also verified
+  directly in LiteLLM's source rather than assumed, so that path was
+  already covered.) Fixed by adding `enable_google()`, patching
+  `Models`/`AsyncModels.generate_content` the same way `enable_openai`/
+  `enable_anthropic` already patch `Completions`/`Messages.create`.
+  `_PROVIDER_ADAPTERS` grew a third leg per provider — prompt-text
+  extraction is now itself per-provider (`messages=` for openai/
+  anthropic, `contents=` for google-genai, which has a structurally
+  different shape: `Content`/`Part` objects rather than role/content
+  dicts), alongside the completion-text and usage extractors that
+  already existed — so `_scan_prompt_or_raise` reads prompts through an
+  injected extractor instead of a hardcoded `messages` lookup. Error
+  classification also branches per provider now: `google-genai` has a
+  genuinely different exception shape from openai/anthropic (`APIError`/
+  `ClientError`/`ServerError` with a `.code` HTTP status, no
+  `RateLimitError`/`APITimeoutError` class names at all — checked
+  directly against the installed SDK, not assumed) — network-level
+  failures are classified from the underlying transport's own exceptions
+  instead (`google-genai` uses `httpx` for its async client and
+  `requests` for its sync client, both hard dependencies, not optional —
+  verified in `_api_client.py`). Every real API shape used here —
+  `GenerateContentResponse.text`, `.usage_metadata.prompt_token_count`/
+  `.candidates_token_count`, `Content.parts`/`Part.text`,
+  `Models.generate_content`'s keyword-only signature — was checked
+  against the actually-installed `google-genai` package before writing
+  the adapter, the same discipline already applied to the openai/
+  anthropic exception hierarchy in v0.8.
+
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
 Shared audit infrastructure across surfaces turned out to matter more than

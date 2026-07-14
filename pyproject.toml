@@ -1,6 +1,6 @@
 [project]
 name = "marshal-ai"
-version = "0.9.0"
+version = "0.10.0"
 description = "Governance for AI systems: permission-aware retrieval, tool-call approval with rate limiting/jurisdictional risk tiering, model routing/budgets/data-residency/reliability, and an audit trail — one library, one place to see what happened."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -30,11 +30,13 @@ dev = [
     "opentelemetry-sdk>=1.20",
     "openai>=1.0",
     "anthropic>=0.30",
+    "google-genai>=1.0",
 ]
 chroma = ["chromadb>=0.4"]
 opentelemetry = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 openai = ["openai>=1.0"]
 anthropic = ["anthropic>=0.30"]
+google-genai = ["google-genai>=1.0"]
 
 [build-system]
 requires = ["hatchling"]

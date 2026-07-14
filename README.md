@@ -42,9 +42,13 @@ Three governance surfaces, one shared audit trail:
   report usage back.
 
 Plus **one-line, framework-agnostic model governance** (`marshal_ai.integrations`)
-— patches the OpenAI/Anthropic SDK clients directly, so LangChain, LangGraph,
-CrewAI, AutoGen, Google ADK, or a raw script all get governed without
-touching that framework's own code. See below.
+— patches the OpenAI, Anthropic, and Google GenAI SDK clients directly, so
+LangChain, LangGraph, CrewAI, AutoGen, Google ADK, or a raw script all get
+governed without touching that framework's own code. The Google GenAI
+patch specifically is what governs ADK's default `LlmAgent` path — ADK
+calls Gemini through `google-genai` directly, not through LiteLLM or the
+openai/anthropic clients, verified against ADK's own source rather than
+assumed. See below.
 
 Plus **deterministic sensitive-data detection** (`marshal_ai.sensitive`) —
 a different question from the three guards above: not "is this allowed"
@@ -333,25 +337,35 @@ guard = ModelGuard(policy=AllowlistModelPolicy({"gpt-4o": [ModelCandidate("gpt-4
 marshal_integrations.enable(guard, Principal(id="service-account"))
 
 # anything below this line — including code inside LangChain, LangGraph,
-# CrewAI, AutoGen, or ADK — is now governed, with zero changes to that code:
+# CrewAI, AutoGen, or an ADK LlmAgent — is now governed, with zero changes
+# to that code:
 import openai
 openai.OpenAI().chat.completions.create(model="gpt-4o", messages=[...])
-# ^ actually calls "gpt-4o-mini"; usage auto-reported to `guard` from the
-# real response; a request for an unrouted model raises ModelCallDenied
-# *before* any network call happens.
+# ^ actually calls "gpt-4o-mini"; usage/latency/success auto-reported to
+# `guard` from the real response; a request for an unrouted model raises
+# ModelCallDenied *before* any network call happens.
 ```
 
-Run `python examples/framework_integration_example.py` for a fuller
-walkthrough (denial path only, so it runs with no API key).
+Run `python examples/framework_integration_example.py` for the OpenAI/
+Anthropic case, or `python examples/adk_gemini_example.py` specifically
+for Google ADK's default model path (both denial-path-only, so they run
+with no API key).
 
-Patches the OpenAI and Anthropic SDK client classes (sync + async) by
-exact method reference, resolved when `enable()` runs — not the
-framework's code, which is what makes this work underneath any framework
-built on either SDK without per-framework adapters. `disable_all()`
-restores the originals. The known cost, stated plainly: this breaks
-silently on a breaking SDK change to those exact classes/methods (it'll
-raise clearly at `enable()` time, not patch nothing silently — but it will
-need updating when that happens). This surface only covers *model*
+Patches the OpenAI, Anthropic, and Google GenAI SDK client classes
+(sync + async) by exact method reference, resolved when `enable()` runs
+— not the framework's code, which is what makes this work underneath any
+framework built on any of the three without per-framework adapters. For
+ADK specifically: `LlmAgent` calls Gemini through `google-genai`'s
+`Models.generate_content` by default (not LiteLLM, not the openai/
+anthropic clients — checked against ADK's own source, not assumed), and
+`LiteLlm(model="openai/...")`/`LiteLlm(model="anthropic/...")` genuinely
+does call through to the real `openai`/`anthropic` client classes
+underneath (also checked, not assumed) — so `enable()` covers both of
+ADK's model paths with the same one call. `disable_all()` restores the
+originals. The known cost, stated plainly: this breaks silently on a
+breaking SDK change to those exact classes/methods (it'll raise clearly
+at `enable()` time, not patch nothing silently — but it will need
+updating when that happens). This surface only covers *model*
 routing/budget, deliberately — tool-call execution happens inside each
 framework's own dispatch code at a different layer with no equivalent
 single choke point; use `ToolGuard` directly around your tool functions
@@ -595,19 +609,21 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.9 — all three governance surfaces (retrieval; tool calls with rate
+v0.10 — all three governance surfaces (retrieval; tool calls with rate
 limiting, runaway-loop detection, and jurisdiction-aware risk tiering;
 model routing/budgets/cross-border data residency/data retention/
 reliability-aware circuit breaking), one shared audit trail, OpenTelemetry
 export, a local CLI viewer, one-line model governance for any
-OpenAI/Anthropic-based framework via SDK patching (with automatic
-outcome/latency reporting), and deterministic sensitive-data detection
-across every surface. Real Chroma integration for `RetrievalGuard` is
-still in progress — see [`ideas.md`](./ideas.md) for that and what's next
-beyond it (time-to-first-token tracking for streaming calls; an N-failed-
-calls trigger for `RunawayAgentPolicy` once `ToolGuard` reports call
-outcomes the way `ModelGuard` does; a litellm proxy hook for deployments
-already running the LiteLLM proxy; framework-specific tool-call adapters;
+OpenAI/Anthropic/Google-GenAI-based framework via SDK patching (with
+automatic outcome/latency reporting) — including Google ADK's default
+Gemini path specifically, verified against ADK's own source rather than
+assumed — and deterministic sensitive-data detection across every
+surface. Real Chroma integration for `RetrievalGuard` is still in
+progress — see [`ideas.md`](./ideas.md) for that and what's next beyond
+it (time-to-first-token tracking for streaming calls; an N-failed-calls
+trigger for `RunawayAgentPolicy` once `ToolGuard` reports call outcomes
+the way `ModelGuard` does; a litellm proxy hook for deployments already
+running the LiteLLM proxy; framework-specific tool-call adapters;
 policy-as-config).
 
 ## License
