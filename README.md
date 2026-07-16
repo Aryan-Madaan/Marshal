@@ -85,8 +85,44 @@ or failure, with latency) closes that gap, and `CircuitBreakerPolicy`
 acts on it — routing around a deployment that's recently been failing,
 fail-closed if every candidate has tripped. See below.
 
-See [`ideas.md`](./ideas.md) for what's next: real vector-store adapters,
-and a litellm proxy hook for deployments already running the LiteLLM proxy.
+Plus **shadow mode** (`mode="shadow"` on any guard) — computes and audits
+the identical policy decision `mode="enforce"` would, but never acts on
+it: nothing is filtered, redacted, denied, or held for approval, the real
+call always goes through. The low-friction adoption path — wire Marshal
+into a production system with zero risk of breaking anything, watch the
+audit trail build up real signal about what your policies would actually
+do, then flip to `mode="enforce"` once you trust it. See below.
+
+Plus **real vector-store adapters** (`marshal_ai.adapters`) — `from_chroma_
+collection`/`from_langchain_retriever` turn a real Chroma collection or
+any LangChain `BaseRetriever` into exactly the `(query, k) -> list[Document]`
+shape `RetrievalGuard` already expects, so governance, audit, and pushdown
+filtering all run over genuine backend results, not a hand-rolled list.
+See below.
+
+Plus **MCP tool-call governance** (`marshal_ai.mcp.GovernedMCPSession`) —
+MCP (Model Context Protocol) is now the shared tool-integration standard
+most agent frameworks speak, and its own Enterprise-Managed Authorization
+spec explicitly governs the *connection* only, not individual tool
+actions at runtime. `GovernedMCPSession` wraps a real `mcp.ClientSession`
+so every `call_tool()` goes through the same `ToolGuard`/`ToolPolicy`
+machinery above before the request reaches the real MCP server — one
+governed session covers an agent's tool use across every framework that
+talks to that server over MCP. See below.
+
+Plus **durable, tamper-evident audit storage and compliance reports**
+(`marshal_ai.sinks.SQLiteAuditSink`, `marshal_ai.reports`) — `JSONLAuditSink`
+survives a restart but an append-only text file can be edited or
+truncated after the fact with no way to detect it. `SQLiteAuditSink`
+closes that gap on stdlib `sqlite3` alone: indexed queries, and a hash
+chain over every record so `verify()` can name the first record an edit,
+deletion, or reorder broke. `marshal_ai.reports` derives an EU AI Act
+Article 12-shaped activity record and a cross-border data-flow report
+straight from that same audit trail. See below.
+
+See [`ideas.md`](./ideas.md) for what's next: a litellm proxy hook for
+deployments already running the LiteLLM proxy, and adapters for
+Pinecone/pgvector/Weaviate.
 
 ## Install
 
@@ -121,6 +157,54 @@ for entry in guard.audit_log.tail(5):
 
 Run `python examples/basic_example.py` for a fuller walkthrough.
 
+## Quickstart: real vector stores (Chroma, LangChain)
+
+`RetrievalGuard` wraps *any* `(query, k) -> list[Document]` callable. Two
+adapters turn real vector stores into exactly that shape — governance,
+audit, and pushdown all work over genuine backend results, not a toy list:
+
+```python
+import chromadb
+from marshal_ai import AttributePolicy, Principal, RetrievalGuard
+from marshal_ai.adapters import from_chroma_collection
+
+collection = chromadb.EphemeralClient().create_collection("docs")
+collection.add(
+    ids=["policy-1", "salary-1"],
+    documents=["General leave policy...", "Q3 comp review..."],
+    metadatas=[{"note": "public"}, {"acl": ["role:hr"]}],
+)
+
+guard = RetrievalGuard(
+    retriever=from_chroma_collection(collection),
+    policy=AttributePolicy(default="allow"),
+)
+engineer = Principal(id="deepa", attributes={"role:engineering"})
+results = guard.retrieve("compensation", principal=engineer, k=5)
+# excludes salary-1 — real Chroma results, filtered by the same ACL policy
+```
+
+A `GroupPolicy` pushes its filter down into Chroma's native `where` clause
+automatically (the adapter accepts `filter=`), so the store never even
+returns documents the principal can't see — and `RetrievalGuard` still
+re-checks every candidate afterward (defense in depth).
+
+For LangChain, wrap any `BaseRetriever` (including
+`VectorStore.as_retriever()`):
+
+```python
+from marshal_ai.adapters import from_langchain_retriever
+
+guard = RetrievalGuard(
+    retriever=from_langchain_retriever(my_vectorstore.as_retriever()),
+    policy=AttributePolicy(default="allow"),
+)
+```
+
+Needs the `chroma` / `langchain` extra respectively. Run
+`python examples/chroma_example.py` for the full Chroma walkthrough
+(offline, `EphemeralClient`, no API key).
+
 ## Quickstart: tool-call governance
 
 ```python
@@ -141,6 +225,43 @@ guard.call(hr, {"employee_id": "E123", "salary_band": "L6"}, risk_tier="medium")
 ```
 
 Run `python examples/tool_governance_example.py` for a fuller walkthrough.
+
+## Quickstart: MCP tool-call governance
+
+MCP (Model Context Protocol) is now the shared tool-integration standard
+most agent frameworks speak. Its Enterprise-Managed Authorization spec
+governs whether a client may *connect* to a server — it explicitly does
+not govern individual tool actions at runtime, per call, per argument.
+`GovernedMCPSession` is that missing per-action check, wrapping a real
+`mcp.ClientSession` so every `call_tool()` goes through the same
+`ToolGuard`/`ToolPolicy` machinery above *before* the request reaches the
+real MCP server — one governed session covers an agent's tool use across
+every framework that talks to that server over MCP, no per-framework
+adapter needed.
+
+```python
+import asyncio
+from marshal_ai import Principal, RiskTierPolicy
+from marshal_ai.mcp import GovernedMCPSession
+
+async def main():
+    # `session` is a real, already-connected mcp.ClientSession.
+    governed = GovernedMCPSession(
+        session=session,
+        principal=Principal(id="agent-1"),
+        policy=RiskTierPolicy({"low": "allow", "high": "deny"}),
+        risk_tiers={"delete_database": "high", "read_file": "low"},
+    )
+    result = await governed.call_tool("read_file", {"path": "README.md"})
+    # a call to "delete_database" raises ToolCallDenied instead —
+    # the real server never sees that request; audited either way.
+
+asyncio.run(main())
+```
+
+Run `python examples/mcp_governance_example.py` for a fuller walkthrough
+(allow, require-approval, deny, and a hardcoded-credential block, all
+against a real in-process MCP server). Needs `pip install "marshal-ai[mcp]"`.
 
 ## Quickstart: agent reliability (rate limits, runaway loops, jurisdiction)
 
@@ -203,6 +324,43 @@ for candidate in guard.fallback_chain(alice, "default-chat-model"):
 ```
 
 Run `python examples/model_governance_example.py` for a fuller walkthrough.
+
+## Quickstart: shadow mode
+
+Every guard — `RetrievalGuard`, `ToolGuard`, `ModelGuard` — takes an
+optional `mode: Literal["enforce", "shadow"] = "enforce"`. `"enforce"` is
+today's behavior, unchanged. `"shadow"` computes and audits the exact
+same policy decision but never acts on it: `RetrievalGuard` returns every
+document unfiltered and unredacted; `ToolGuard` never raises
+`ToolCallDenied` and never prompts for approval, always calling the
+wrapped tool; `ModelGuard.resolve()` never raises, returning a sensible
+model (the policy's own governed fallback, or the logical name itself)
+even when the real policy would have denied. Every entry a shadow-mode
+guard writes sets `shadow=True` and still records what *would* have
+happened — which document IDs would have been denied, which argument
+fields would have been redacted, whether a call would have required
+approval — so `sink.query(denied_only=True)` and `python -m
+marshal_ai.cli tail --denied-only` show you exactly what enforcement
+would start blocking, before you turn it on.
+
+```python
+guard = ToolGuard(tool=my_tool, policy=my_policy, mode="shadow")
+guard.call(alice, {...}, risk_tier="high")  # never raises, tool actually runs
+for entry in guard.audit_log.tail(5):
+    print(entry.shadow, entry.outcome)  # True, "deny" — what WOULD have happened
+```
+
+This is the adoption on-ramp: wire Marshal into a production system in
+shadow mode with zero risk of breaking anything, watch the audit trail
+build up real signal about what your policies would actually do, then
+flip `mode="enforce"` once you trust it. Note the one place shadow status
+matters downstream: `marshal_ai.reports` (below) reads the same `shadow`
+flag to keep would-have-denied decisions out of a compliance document's
+real enforcement figures — a shadow "deny" never actually blocked
+anything, so it must never be counted as though it did.
+
+Run `python examples/shadow_mode_example.py` for all three guards, side
+by side, in both modes.
 
 ## Quickstart: cross-border data residency
 
@@ -396,6 +554,45 @@ prompt is blocked *before any network call*; a completion that leaks one
 is flagged in the audit trail, since by then the call already happened).
 Run `python examples/sensitive_data_example.py` for all three in one
 shared audit trail.
+
+## Quickstart: durable audit storage & compliance reports
+
+Durable, tamper-evident SQLite audit storage and Article 12/26-shaped
+compliance reports, generated from the same audit trail every guard
+already writes to. `InMemoryAuditSink` doesn't survive a restart;
+`JSONLAuditSink` does, but an append-only text file can be edited or
+truncated after the fact with no way to detect it. `SQLiteAuditSink`
+closes both gaps on stdlib `sqlite3` alone — no new dependency:
+
+```python
+from marshal_ai import SQLiteAuditSink, ToolGuard
+
+sink = SQLiteAuditSink("audit.db")  # survives process restart: same file, new process, same trail
+guard = ToolGuard(tool=my_tool, audit_sink=sink)
+...
+result = sink.verify()  # ChainVerificationResult(ok=True, checked=142) if nothing's been tampered with
+```
+
+`marshal_ai.reports` derives two compliance artifacts *purely* from
+whatever `AuditSink` you hand it — `InMemoryAuditSink`, `JSONLAuditSink`,
+`SQLiteAuditSink`, or your own:
+
+```python
+from marshal_ai import (
+    article12_activity_record, cross_border_data_flow_report,
+    render_activity_record_markdown, render_cross_border_markdown,
+)
+
+print(render_cross_border_markdown(cross_border_data_flow_report(sink)))
+print(render_activity_record_markdown(article12_activity_record(sink, granularity="day")))
+```
+
+Both reports read every entry's `shadow` flag and keep shadow-mode
+would-have-happened decisions in a clearly separate section — a shadow
+"deny" never actually blocked anything, so it's never folded into the
+real allowed/denied/approval-required or cross-border transfer figures
+these reports exist to get right. Run `python
+examples/compliance_report_example.py` for a full end-to-end walkthrough.
 
 ## How it works
 
@@ -609,7 +806,7 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.10 — all three governance surfaces (retrieval; tool calls with rate
+v0.11 — all three governance surfaces (retrieval; tool calls with rate
 limiting, runaway-loop detection, and jurisdiction-aware risk tiering;
 model routing/budgets/cross-border data residency/data retention/
 reliability-aware circuit breaking), one shared audit trail, OpenTelemetry
@@ -618,12 +815,19 @@ OpenAI/Anthropic/Google-GenAI-based framework via SDK patching (with
 automatic outcome/latency reporting) — including Google ADK's default
 Gemini path specifically, verified against ADK's own source rather than
 assumed — and deterministic sensitive-data detection across every
-surface. Real Chroma integration for `RetrievalGuard` is still in
-progress — see [`ideas.md`](./ideas.md) for that and what's next beyond
-it (time-to-first-token tracking for streaming calls; an N-failed-calls
+surface. New this release: an observe-first `mode="shadow"` on every
+guard; real Chroma and LangChain adapters for `RetrievalGuard` (Chroma
+integration is shipped, no longer in progress); MCP tool-call governance
+(`marshal_ai.mcp.GovernedMCPSession`) — the shared choke point every
+MCP-speaking framework now has, reframing the old "tool-call interception
+needs a framework-specific adapter" problem; and durable, tamper-evident
+`SQLiteAuditSink` plus `marshal_ai.reports`' EU AI Act Article 12/26-shaped
+compliance reports, both shadow-mode-aware so a would-have-denied decision
+is never counted as a real one. See [`ideas.md`](./ideas.md) for what's
+next (time-to-first-token tracking for streaming calls; an N-failed-calls
 trigger for `RunawayAgentPolicy` once `ToolGuard` reports call outcomes
 the way `ModelGuard` does; a litellm proxy hook for deployments already
-running the LiteLLM proxy; framework-specific tool-call adapters;
+running the LiteLLM proxy; adapters for Pinecone/pgvector/Weaviate;
 policy-as-config).
 
 ## License

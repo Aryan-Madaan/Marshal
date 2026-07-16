@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
-from marshal_ai.audit import AuditEntry, AuditSink, InMemoryAuditSink, register_entry_type
+from marshal_ai.audit import AuditEntry, AuditSink, InMemoryAuditSink
 from marshal_ai.policy import AllowAll, GuardMode, Policy, Principal
 
 
@@ -37,45 +37,6 @@ def _accepts_filter(retriever: Callable[..., Any]) -> bool:
     if "filter" in params:
         return True
     return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-
-
-@dataclass(frozen=True)
-class RetrievalAuditEntry(AuditEntry):
-    """`AuditEntry` (defined in `audit.py`) grown two optional fields for
-    shadow-mode observability — added here, in the retrieval module,
-    rather than in `audit.py` itself. The self-registering discriminator
-    (`register_entry_type`) already exists precisely so a new event kind
-    can join the audit trail without editing `audit.py`; the same
-    mechanism extends cleanly to a downstream module re-registering an
-    *already-registered* kind with a strict superset schema, which is
-    all this is: every field `AuditEntry` has, in the same order, plus
-    two optional ones. `RetrievalGuard` writes this type exclusively
-    (see `_process` below), and it still reconstructs older JSONL logs
-    that predate shadow mode and simply lack the two new keys — the same
-    optional-with-defaults discipline `ToolCallEntry`/`ModelCallEntry`
-    use for their own new fields.
-
-    `shadow` — True when this entry was written by a `RetrievalGuard`
-    running in shadow mode: the policy decision below was computed and
-    audited but never enforced.
-
-    `would_redact_fields` — for documents the policy would allow, maps
-    document id -> which fields (``"content"`` or a metadata key) its
-    `redact()` would have changed. Field *names* only, matching the
-    existing discipline (`SensitiveDataEntry.findings`,
-    `ToolCallEntry.arguments`) that the audit trail never stores the
-    value a redaction was meant to hide, only what was hidden.
-    """
-
-    shadow: bool = False
-    would_redact_fields: dict[str, list[str]] = field(default_factory=dict)
-
-
-# Overrides the plain `AuditEntry` registration `audit.py` performs at its
-# own import time — safe because `RetrievalAuditEntry` is a strict,
-# backward-compatible superset of it (see the docstring above). Every
-# "retrieval"-kind line, old or new, decodes correctly either way.
-register_entry_type("retrieval", RetrievalAuditEntry)
 
 
 def _redacted_document_fields(original: Document, redacted: Document) -> list[str]:
@@ -166,7 +127,7 @@ class RetrievalGuard:
                 denied_reasons[doc.id] = decision.reason
 
         self._audit_sink.write(
-            RetrievalAuditEntry(
+            AuditEntry(
                 timestamp=time.time(),
                 principal_id=principal.id,
                 query=query,

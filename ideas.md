@@ -299,6 +299,182 @@ piece of that story, not this one.
   the adapter, the same discipline already applied to the openai/
   anthropic exception hierarchy in v0.8.
 
+- **v0.11 — shadow mode (`mode="shadow"`) on all three guards.** The
+  observability-first adoption path: `RetrievalGuard`/`ToolGuard`/
+  `ModelGuard` all take `mode: Literal["enforce", "shadow"] = "enforce"`.
+  Shadow computes and audits the identical policy decision `enforce`
+  would, but never acts on it — nothing is filtered, redacted, denied, or
+  held for approval; the real call always goes through. Implemented by
+  reusing each entry type's existing `outcome`/`allowed_ids`/`denied_ids`
+  vocabulary for the *real* decision (not inventing a parallel
+  "would_deny" enum) plus one new `shadow: bool` flag — which means a
+  shadow "deny" already shows up under `AuditSink.query(denied_only=True)`
+  and the CLI's `!` flag with zero changes to either, since both already
+  duck-type on `outcome`/`denied_ids`. The two retrieval-only fields
+  (`shadow`, `would_redact_fields`) needed a home on `marshal_ai.audit.
+  AuditEntry` itself; the first draft added them via a `RetrievalAuditEntry
+  (AuditEntry)` subclass re-registered under the existing `"retrieval"`
+  kind (`audit.py` was off-limits while shadow mode was built on its own
+  branch) — a pre-merge review flagged that as import-order-fragile (a
+  plain `AuditEntry(**shadow_dict)` only decodes correctly because
+  `marshal_ai/__init__.py` happens to import `retrieval.py`, which
+  overrides the registry, before any decode runs), so at integration the
+  two fields were folded directly onto `AuditEntry` and the subclass/
+  re-registration deleted — strictly simpler, and the fragility is gone.
+  Left out of scope, deliberately: `otel.py` doesn't export `shadow`/
+  `would_redact_fields` as span attributes yet (its generic per-kind
+  handlers only read the keys they already knew about; nothing broke, the
+  two new keys are just invisible to Grafana/Honeycomb for now) — a real
+  follow-up, not a functional gap in shadow mode itself. Also out of
+  scope: no aggregate "shadow mode summary" report as its own mechanism —
+  that turned out to matter enough to build anyway, but as part of
+  `marshal_ai.reports` below rather than a bespoke summarizer, once
+  shadow mode and the compliance reports landed in the same release and
+  the cross-cutting bug between them (next entry) made the connection
+  unavoidable.
+
+- **v0.11 — real vector-store adapters for `RetrievalGuard` (Chroma +
+  LangChain).** Closes the standing "proven only against a fake in-memory
+  retriever" backlog item below — the single most legitimate knock on the
+  retrieval surface, since every retrieval test until now ran against a
+  hand-rolled list, so "wraps *any* retriever" was an unproven claim.
+  `marshal_ai.adapters` adds `from_chroma_collection` and
+  `from_langchain_retriever`, each producing the exact `(query, k) ->
+  list[Document]` (optionally `filter=`) shape `RetrievalGuard` already
+  expects, with no new import-time dependency on either backend (the
+  adapters only call methods on caller-supplied objects) — reached via
+  the `marshal_ai.adapters` submodule rather than re-exported from the
+  top-level namespace, the same pattern `marshal_ai.otel`/`marshal_ai.
+  integrations` already use, so `import marshal_ai` stays free of any
+  optional-backend import. Tests run end-to-end against a real
+  `chromadb.EphemeralClient` collection and a real `langchain_core.
+  InMemoryVectorStore` retriever — offline, no API keys, using a tiny
+  deterministic embedding function instead of Chroma's network-downloaded
+  default ONNX model. Verified against the *actually installed* packages,
+  not assumed: chromadb 1.5.9's `Collection.query` returns a dict of
+  parallel lists nested one level per query text (read at `[0]`), empty
+  results come back as `[[]]` not `None`, and `n_results=0` raises
+  `TypeError` (so `k<=0` short-circuits); langchain_core 1.4.9's
+  `BaseRetriever.invoke(query, **kwargs)` returns `list[Document]`
+  directly, `k` passed through kwargs genuinely reaches
+  `similarity_search`, and `Document.id` is an optional field
+  (synthesized deterministically as `lc-{index}` when absent, since
+  Marshal's `Document.id` is required and keys the audit trail). The
+  adapter deliberately maps Chroma's raw `distance` straight onto
+  `Document.score` without renormalizing to a 0–1 "similarity" — that
+  mapping depends on the collection's configured space (l2/cosine/ip),
+  which Marshal has no way to know, so inventing one would be a lie
+  dressed as a convenience. Not folded in yet: async adapters
+  (`aretrieve` currently calls the sync retriever inline — fine for
+  these, a real-I/O async client should be wrapped in `asyncio.to_thread`
+  by the caller), and adapters for Pinecone/pgvector/Weaviate (same
+  pattern, add per-backend as adoption justifies — see backlog).
+
+- **v0.11 — MCP tool-call governance (`marshal_ai.mcp.GovernedMCPSession`).**
+  Reframes the "framework-specific tool-call interception" backlog item
+  below, rather than fully closing it: that item's premise was "tool-call
+  execution has no equivalent [to the model-call SDK choke point] — it
+  happens inside each framework's own dispatch code... different shape
+  per framework, not one shared choke point." That premise is no longer
+  true for any framework that speaks MCP — MCP is now the standard tool-
+  integration protocol most agent frameworks use, and its own Enterprise-
+  Managed Authorization spec governs the *connection* only, explicitly
+  not individual tool actions at runtime — an acknowledged gap in the
+  protocol itself, not a Marshal assumption. `GovernedMCPSession` wraps a
+  real `mcp.ClientSession` so `call_tool()` runs through `ToolGuard`'s
+  existing evaluate/redact/approve/audit sequence before a `tools/call`
+  request reaches the server, fail-closed — one governed session, one
+  choke point, covering every framework that talks to that server over
+  MCP, the same "wrap the consumer's side of the boundary" shape every
+  other Marshal guard already has. Reuses `ToolGuard.call()` itself, not
+  just its types: `ToolGuard.call()` is synchronous and `mcp.ClientSession.
+  call_tool` is a coroutine function, a real mismatch — resolved by
+  building a `ToolGuard` per call with `tool=lambda **kw: self._session.
+  call_tool(name, kw, ...)`; calling a Python `async def` function never
+  runs its body, only constructs a coroutine object, so `ToolGuard.call()`
+  runs its entire unmodified code path synchronously and its allow-path
+  return merely constructs the real coroutine, which `GovernedMCPSession`
+  then awaits. On deny, `ToolGuard.call()` raises before the lambda is
+  ever invoked, so the coroutine — and the real request it represents —
+  is never constructed at all. Verified against the installed `mcp` SDK
+  (1.28.1) before writing any code, and `tests/test_mcp.py` passes 9/9
+  under `-W error::RuntimeWarning` (no "coroutine was never awaited"
+  leak on the deny path). Deny raises `ToolCallDenied` (the same
+  exception every other Marshal guard raises), not an `isError=True`
+  `CallToolResult` — MCP's `isError` already means "the tool ran and
+  failed," and collapsing "governance blocked this before the server saw
+  it" into that shape would erase a distinction Marshal insists on
+  elsewhere. Honest scope note: this governs the *client* side of one MCP
+  session; a server that doesn't trust every client to route through a
+  governed proxy needs server-side middleware instead — different,
+  not-yet-built work, and tool dispatch that never goes through MCP at
+  all still needs `ToolGuard` wrapped directly, exactly as documented
+  before this release.
+
+- **v0.11 — `SQLiteAuditSink` + `marshal_ai.reports`: durable,
+  tamper-evident record-keeping and the compliance artifacts derived from
+  it.** The EU AI Act's high-risk obligations become binding 2026-08-02:
+  Article 12 requires automatic record-keeping, Article 26 requires
+  deployers retain those logs for >=6 months. `InMemoryAuditSink` doesn't
+  survive a restart at all; `JSONLAuditSink` does, but an append-only
+  text file can be edited or truncated after the fact with no way to
+  detect it, and every read means re-parsing the whole file.
+  `SQLiteAuditSink` closes both gaps on stdlib `sqlite3` alone — no new
+  dependency — with the same `AuditSink` interface every other sink
+  implements: `write`/`all_entries` for the abstract contract, `query`
+  overridden to push `principal_id`/`since`/`until` down into indexed SQL
+  instead of reconstructing every row, `tail` inherited unchanged. Every
+  stored record also carries a hash over (its own canonical content, the
+  previous record's hash) — a hash chain — so `verify()` can walk the
+  chain and name the first record where an edit, deletion, or reorder
+  broke it. `marshal_ai.reports` then derives two compliance artifacts
+  *purely* from whatever `AuditSink` you hand it (no new state of its
+  own): a cross-border data-flow report — the concrete artifact behind
+  the "the model call *is* the transfer" thesis `ResidencyPolicy` shipped
+  with in v0.7 — aggregating which jurisdictions data flowed to, under
+  which mechanism, under which controller, and how many calls; and an
+  Article-12-style activity record, per-period allowed/denied/
+  approval-required counts across all three governed surfaces. The
+  cross-border report has to parse `ModelCallEntry.reason` with a narrow,
+  documented regex to recover jurisdiction/mechanism/controller, because
+  `ResidencyPolicy` records them only in that free-text reason today, not
+  as structured fields — calls resolved by residency governance that
+  don't match that exact shape are counted separately
+  (`unparsed_allowed_calls`) rather than silently dropped.
+  **The cross-cutting bug a pre-merge review caught, that neither shadow
+  mode nor these reports could see alone**: shadow mode and this release
+  shipped in the same pass, and a shadow-mode "deny"/"require_approval"
+  entry means the guarded action *actually proceeded* (shadow never
+  enforces anything — see the shadow-mode entry above) — but both
+  reports were originally written against enforce-mode assumptions and
+  folded a shadow "deny" straight into `denied`/`denied_transfer_
+  attempts`, which would tell a regulator a transfer was blocked when it
+  in fact happened. Fixed before merge: both report functions now read
+  each entry's `shadow` flag and route shadow-mode entries into a fully
+  separate accounting (`ActivityRecord.shadow_counts`/`shadow_totals`,
+  `CrossBorderDataFlowReport.shadow_observed_calls`/`shadow_would_have_
+  denied_transfers`) that never touches the real enforcement figures —
+  surfaced in their own clearly labeled section in both Markdown
+  renderers, not merged and not silently dropped either. A second,
+  same-root defect fixed alongside it: a shadow `ToolCallEntry` can carry
+  the raw `outcome == "require_approval"` (enforce mode always resolves
+  it to `"approved"`/`"declined"` first), which the normalized-bucket set
+  didn't recognize at all, so it landed in `outcome_breakdown` but none
+  of `allowed`/`denied`/`approval_required` — silently uncounted; fixed
+  by adding it to the approval-outcome set, where it now correctly lands
+  in the shadow-mode `approval_required` bucket.
+  **Explicitly out of scope, and why**: this is Marshal's record of its
+  *own* decisions, made tamper-evident after the fact — it proves what
+  Marshal decided and that the log of those decisions wasn't quietly
+  rewritten. It is not, and cannot be, proof that a model vendor actually
+  processed data only where it was routed, or actually deleted it on
+  schedule — Marshal has no API into a vendor's infrastructure to check
+  that, the same honest limit `ResidencyPolicy`/`RetentionPolicy` already
+  state for the routing decision itself. Multi-process concurrent writes
+  to one `SQLiteAuditSink` file aren't coordinated (each process caches
+  its own chain tip); route writes through a single process if that
+  matters for your deployment.
+
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
 Shared audit infrastructure across surfaces turned out to matter more than
@@ -322,22 +498,23 @@ keeping each surface's scope maximally narrow.
   and review, not folding into the same release that shipped non-streaming
   reliability tracking.
 
-- **Real vector-store integration for `RetrievalGuard`.** Everything's only ever
-  been proven against a fake in-memory retriever. A real Chroma adapter (via
-  `chromadb`, optional dependency, EphemeralClient for tests — no network needed)
-  is in progress; a real integration test against it is the actual proof this
-  isn't a toy.
+- **Vector-store adapters beyond Chroma/LangChain (Pinecone, pgvector,
+  Weaviate).** v0.11 shipped `from_chroma_collection`/
+  `from_langchain_retriever` (see Shipped above) — same pattern applies
+  cleanly to the others; add per-backend as adoption justifies rather
+  than speculatively building all three now.
 
-- **Framework-specific tool-call interception.** `marshal_ai.integrations`
-  covers *model* calls because there's one choke point (the SDK client) nearly
-  every framework shares. Tool-call *execution* has no equivalent: it happens
-  inside each framework's own dispatch code (LangChain's `Tool.run`, ADK's
-  callback hooks, a hand-rolled loop) after the model's response is parsed —
-  different shape per framework, not one shared choke point. This means
-  one-line tool governance genuinely needs N framework-specific adapters, not
-  one patch. Today, wrapping your tool functions in `ToolGuard` directly is
-  the real (explicit, not automatic) answer. Worth revisiting per-framework
-  once one specific framework's adoption justifies the adapter.
+- **Framework-specific tool-call interception for frameworks that don't
+  speak MCP.** v0.11's `GovernedMCPSession` (see Shipped above) closes
+  this for any framework built on MCP, which reframed the original
+  problem: MCP is now the shared choke point tool calls never had before.
+  What's left is narrower than the original item — a framework whose tool
+  dispatch never goes through MCP at all (a hand-rolled loop calling
+  Python functions directly, or a framework's own non-MCP tool-calling
+  convention) still has no equivalent SDK-patch choke point the way model
+  calls do; wrapping tool functions in `ToolGuard` directly remains the
+  real (explicit, not automatic) answer there, same as before this
+  release.
 
 - **A litellm proxy hook**, for teams already running the LiteLLM proxy rather
   than calling `openai`/`anthropic` directly — `async_pre_call_hook` on a

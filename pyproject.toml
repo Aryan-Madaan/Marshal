@@ -1,7 +1,7 @@
 [project]
 name = "marshal-ai"
-version = "0.10.0"
-description = "Governance for AI systems: permission-aware retrieval, tool-call approval with rate limiting/jurisdictional risk tiering, model routing/budgets/data-residency/reliability, and an audit trail — one library, one place to see what happened."
+version = "0.11.0"
+description = "Governance for AI systems: permission-aware retrieval (with real Chroma/LangChain vector-store adapters) backed by an observe-first shadow mode, tool-call approval with rate limiting/jurisdictional risk tiering (including MCP tool-call governance), model routing/budgets/data-residency/reliability, and a durable, tamper-evident audit trail with EU AI Act-shaped compliance reports — one library, one place to see what happened."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Aryan Madaan" }]
@@ -31,8 +31,13 @@ dev = [
     "openai>=1.0",
     "anthropic>=0.30",
     "google-genai>=1.0",
+    "chromadb>=0.4",
+    "langchain-core>=0.3",
+    "mcp>=1.0",
 ]
 chroma = ["chromadb>=0.4"]
+langchain = ["langchain-core>=0.3"]
+mcp = ["mcp>=1.0"]
 opentelemetry = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 openai = ["openai>=1.0"]
 anthropic = ["anthropic>=0.30"]

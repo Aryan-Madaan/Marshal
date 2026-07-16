@@ -463,6 +463,288 @@ that don't exist. Two classifier functions, correctly scoped to what each
 SDK actually raises, beats one classifier pretending three SDKs share a
 hierarchy they don't.
 
+## Where shadow mode (`GuardMode`) sits, and why
+
+**Decision point — `GuardMode` lives in `policy.py`, next to `Principal`.**
+Shadow mode is a cross-cutting concern (`RetrievalGuard`/`ToolGuard`/
+`ModelGuard` all take `mode: GuardMode`), so it needs a home none of the
+three surfaces has to import another surface's file to reach — the same
+reasoning that already put `Principal` in `policy.py` rather than in
+whichever surface happened to be built first (see "why `policy.py` is its
+own file," above). `GuardMode` is a bare `Literal["enforce", "shadow"]`
+type alias, not a class hierarchy — no new ABC, nothing to subclass.
+
+**Decision point — `outcome`/`allowed_ids`/`denied_ids` keep their
+enforce-mode meaning in shadow entries; `shadow: bool` is the only new
+enforcement-status flag.** The alternative (a parallel `would_deny: bool`,
+`would_be_outcome: str`, etc., leaving `outcome` always reflecting "what
+actually happened") was considered and rejected: it would silently break
+`AuditSink.query(denied_only=True)` and the CLI's `!`/otel `ERROR`-status
+logic for shadow-mode denials, which is exactly the audience shadow mode
+exists to serve — someone trying to answer "what would enforcement have
+blocked" needs that to fall out of the *existing* denial-flagging
+machinery, not a second, unwired-up flag they have to know to check
+separately. Reusing the vocabulary means "would deny" and "did deny" are
+literally the same signal, disambiguated only by the new `shadow` flag —
+and every existing consumer (`is_denied()`, the CLI, `otel.py`'s
+`_write_tool_call`/`_write_model_call`) already handles it correctly with
+*zero* changes to any of those three files.
+
+**Decision point — `ModelGuard.resolve()` returns a model, not `None` or
+a sentinel, when shadow + denied.** Considered three options: raise
+anyway (rejected — spec requires never raising in shadow), return `None`
+(rejected — every caller's very next line is "call this model with a real
+client"; `None` just moves the crash one line downstream and loses the
+"zero risk to prod" property that's shadow mode's entire point), or
+compute a real fallback (chosen). `ModelGuard._shadow_fallback_model`
+prefers the wrapped policy's own `fallback_chain()` — which can be
+non-empty even under a denial (e.g. `BudgetPolicy.fallback_chain`
+forwards to its base regardless of tracked spend) — and only falls back
+to the bare `logical_name` itself when the policy has genuinely nothing
+configured, mirroring `AllowAllModels`'s own last-resort behavior. This
+means a shadow `ModelCallEntry` can have `outcome == "deny"` *and* a
+non-`None` `resolved_model` at the same time — a new state that never
+occurs in enforce mode, documented directly in `ModelCallEntry`'s
+docstring so it doesn't read as an inconsistency later, and exactly the
+fact `marshal_ai.reports` has to account for (see below): a shadow
+"deny" is not a blocked transfer, it's a transfer to a fallback.
+
+**Decision point — `ToolGuard`'s audited `arguments` field stays redacted
+in shadow mode; only field *names* (`would_redact_fields`) are added, not
+raw values.** Unlike `RetrievalGuard` (which hands the *caller* fully
+unredacted content in shadow — there was never any other audience for
+that data), the `ToolCallEntry.arguments` field is audit-trail-facing
+content whose redaction exists to protect whoever reads the log/approval
+prompt, not to enforce anything against the caller. Toggling that off in
+shadow mode would mean a policy author who wrote `ArgumentRedaction(
+name="ssn", ...)` to keep SSNs out of the audit trail would suddenly get
+them in the audit trail the moment they tried shadow mode first — the
+opposite of "zero risk." Kept identical to enforce; `would_redact_fields`
+(names only) is the new, additive signal for "here's what a stricter/
+attribute-gated approver would not have seen."
+
+**Decision point — the two new `AuditEntry` fields (`shadow`,
+`would_redact_fields`) live directly on the base dataclass in `audit.py`,
+not on a subclass.** The first implementation grew these on
+`RetrievalGuard`'s side of a branch boundary that (deliberately, for that
+branch) kept `audit.py` off-limits: `retrieval.py` defined a
+`RetrievalAuditEntry(AuditEntry)` subclass — same fields, same order,
+two new ones with defaults — and called `register_entry_type("retrieval",
+RetrievalAuditEntry)` at its own import time, overriding the base
+registration `audit.py` performs for plain `AuditEntry`. This was a
+legitimate, LSP-safe use of the self-registering-discriminator mechanism
+(`RetrievalAuditEntry` is-a `AuditEntry`, same field order, `to_dict()`
+inherited unchanged) and the full test suite passed unmodified against
+it. A pre-merge review caught the real cost anyway: a plain
+`AuditEntry(**shadow_dict)` raises `TypeError` on the two new keys, so
+decoding a shadow "retrieval" JSONL/SQLite line only worked because
+`marshal_ai/__init__.py` happens to import `retrieval.py` (which
+overrides the registry) before any decode runs — correctness riding on
+import ordering that a future refactor of `__init__.py` could silently
+break, for no remaining reason once `audit.py` was back on the table at
+integration time (the parallel-branch constraint that motivated the
+subclass no longer applied once every branch merged into one tree).
+Fixed by moving `shadow`/`would_redact_fields` directly onto `AuditEntry`
+in `audit.py` and deleting `RetrievalAuditEntry` and its re-registration
+entirely — `RetrievalGuard` now writes a plain `AuditEntry`, strictly
+simpler, with no registry-override, no import-order dependency.
+`RetrievalAuditEntry` was never exported, so nothing external depended on
+the name. The re-registration *pattern* itself (overriding an
+already-registered kind with a strict superset schema) remains a
+legitimate, documented escape hatch for a future case where a field
+genuinely can't be added to the base file — just not the right call here
+once that constraint was lifted.
+
+## Where the vector-store adapters (`marshal_ai.adapters`) sit, and why
+
+**Decision point — the adapters live in the library, not as separate
+`marshal-chroma` / `marshal-langchain` packages.** Each adapter is a
+single small factory function with *zero import-time dependency* on its
+backend — `from_chroma_collection` / `from_langchain_retriever` only ever
+call methods (`.query(...)`, `.invoke(...)`) on an object the caller
+already constructed and passed in, so `import marshal_ai.adapters`
+succeeds with neither `chromadb` nor `langchain_core` installed, and
+having one installed never drags in the other. That removes the usual
+reason to split an integration into its own distributable (avoiding a
+hard dependency), so a separate package would be pure release/versioning
+overhead for two functions. They stay guarded behind optional extras
+(`[chroma]`, `[langchain]`) and reached via the `marshal_ai.adapters`
+submodule rather than re-exported from the top-level namespace — the same
+pattern already used for `marshal_ai.otel` and `marshal_ai.integrations`,
+keeping the core `import marshal_ai` free of any optional-backend import.
+
+**Decision point — Chroma's raw `distance` maps straight onto
+`Document.score`, never renormalized to a 0–1 "similarity."** That
+mapping depends on the collection's configured distance space (l2/
+cosine/ip), which Marshal has no way to know from the outside — inventing
+a normalization would be a confident-looking number with no actual basis,
+exactly the kind of lie-dressed-as-convenience this project's other
+tradeoffs sections already reject (see `ResidencyPolicy`'s mechanism
+field, `SensitiveDataEntry.findings`'s no-raw-secrets rule). `score`
+isn't load-bearing for any governance decision, so leaving it as the raw,
+honestly-labeled distance is strictly better than a plausible-looking
+guess.
+
+**Decision point — the Chroma adapter accepts `filter=` by that exact
+name, reusing `RetrievalGuard`'s existing pushdown extension point
+(`_accepts_filter`) rather than adding a new one.** `GroupPolicy.
+to_filter` already knows how to produce a native filter dict for any
+retriever whose signature accepts `filter=`; the Chroma adapter just
+needs to accept that keyword and translate it into a `where` clause —
+OCP in the sense the codebase already established (extended behavior via
+the existing extension point, zero changes to `RetrievalGuard`, `Policy`,
+or `Document`).
+
+## Where `marshal_ai.mcp` sits, and why
+
+**Decision point — client-side proxy, not server-side middleware.** MCP
+tool governance could live on either side of the connection: a
+`GovernedMCPSession` wrapping the client's `ClientSession` (what got
+built), or middleware inside an MCP server that checks policy before
+dispatching to a registered tool handler. Client-proxy was chosen first
+because it matches every other Marshal guard's shape exactly — `ToolGuard`
+wraps the *caller's* access to a callable, `RetrievalGuard` wraps the
+caller's access to a retriever, `ModelGuard` resolves before the caller's
+own SDK call — Marshal governs from the consumer's side of a boundary
+throughout, never by modifying the thing being called. It also composes
+with zero coordination: any MCP server, first-party or third-party,
+already-deployed or not, gets governed the moment a client wraps its
+session, with no server-side deploy required. The real limitation, stated
+plainly: a client that doesn't route through `GovernedMCPSession` bypasses
+governance entirely — this only works when the governance owner also
+controls the client. A server operator who can't trust every client to
+opt in needs server-side middleware instead, enforcing policy regardless
+of which client connects; that's real, different work (a different
+extension point in `mcp.server`, not just a different constructor
+argument) and is intentionally not this pass's scope.
+
+**Decision point — reuses `ToolGuard` itself, not just its types.**
+`ToolGuard.call()` is synchronous; `mcp.ClientSession.call_tool` is a
+coroutine function — a real mismatch, not a cosmetic one. Rather than
+duplicating `ToolGuard.call()`'s evaluate -> redact -> (approve) -> audit
+sequence in `mcp.py` (which would create exactly the kind of sync/async
+copy this codebase's own DRY discipline elsewhere warns against),
+`GovernedMCPSession.call_tool` builds a `ToolGuard` per call with
+`tool=lambda **kw: self._session.call_tool(name, kw, ...)`. Calling a
+Python `async def` function never runs its body — it only constructs a
+coroutine object — so `ToolGuard.call()` runs its entire existing,
+unmodified code path synchronously, and on the allow/approved branch its
+final line (`return self._tool(**arguments)`) merely constructs the real
+`call_tool` coroutine, which `GovernedMCPSession` then awaits itself. On
+the deny/declined branch, `ToolGuard.call()` raises before ever reaching
+`self._tool(...)`, so that coroutine — and the real request it
+represents — is never constructed at all, not just uncalled. Verified
+under `-W error::RuntimeWarning` (no "coroutine was never awaited" leak
+on the deny path) before wiring it into `mcp.py`.
+
+**Decision point — deny raises `ToolCallDenied`, not an `isError=True`
+`CallToolResult`.** MCP's own `CallToolResult.isError` shape already means
+something specific: the tool *ran* and failed. Reusing it for "governance
+blocked this before the server ever saw it" would collapse two different
+facts into one shape — exactly the conflation `CircuitBreakerPolicy`'s own
+docs already reject elsewhere ("a governance denial is never a recorded
+failure"). Raising `ToolCallDenied` — the same exception type `ToolGuard`
+and `ModelGuard` already raise on their own denials — keeps one exception
+type meaning "Marshal said no" across every surface. A framework loop that
+specifically wants `isError` results instead of exceptions can translate
+`ToolCallDenied` at its own boundary in one line; not baked into Marshal.
+
+**Decision point — principal bound at session construction, not per
+call.** `ToolGuard.call(principal, ...)` takes a principal per call
+because it wraps a bare Python callable with no session concept at all.
+An MCP `ClientSession` already *is* a session scoped to one connected
+identity, so `GovernedMCPSession(session, principal, ...)` binds it once,
+matching what the thing being wrapped actually is instead of re-deriving
+an already-fixed fact on every call.
+
+**Decision point — `risk_tiers: dict[tool_name, tier]` at the session
+level, not inside `ToolPolicy`.** `RiskTierPolicy` maps *tier -> outcome*;
+it has no notion of tool names, by design (a `ToolGuard` is already
+scoped to one named tool, so this mapping never needed to exist before).
+An MCP session exposes many tools, named only at call time, so
+`GovernedMCPSession` owns the *tool name -> tier* half of the lookup
+itself (with a `default_risk_tier` fallback and a per-call override), and
+hands the resolved tier to whatever `ToolPolicy` the caller supplied —
+composable with `RiskTierPolicy`, `JurisdictionalRiskTierPolicy`,
+`RateLimitPolicy`, `RunawayAgentPolicy`, `SensitiveDataToolPolicy`,
+`RedactingToolPolicy`, or any stack of them, unchanged.
+
+**Note on `marshal_ai.mcp`'s own dependency posture:** `ClientSession`/
+`CallToolResult`/`ListToolsResult`/`ProgressFnT` are imported only under
+`TYPE_CHECKING` — `GovernedMCPSession` duck-types whatever `session`
+object it's given (`.call_tool(...)`, `.list_tools(...)`, forwarded via
+`__getattr__`), the same way `ToolGuard` never imports whatever library a
+wrapped callable came from. `import marshal_ai.mcp` succeeds with no `mcp`
+package installed; the `mcp` extra exists purely for whoever wants to
+actually *construct* a real `mcp.ClientSession` to hand it.
+
+## Where `SQLiteAuditSink`/`marshal_ai.reports` sit, and why
+
+**Why SQLite (stdlib) over a DB dependency.** The brief was durable +
+queryable + indexed + survives-restart, without adding a dependency to a
+library whose whole pitch is "governance without infra." `sqlite3` is
+bundled with every CPython install, gives real transactions and real
+indexes, and is a file you can hand to `sqlite3 audit.db` or ship to S3 —
+versus adding `psycopg2`/an ORM/a message-queue client for a feature
+whose target user is often a solo dev or a mid-size team that doesn't
+want to stand up Postgres just to get a compliant audit log. The
+`AuditSink` ABC already makes this a non-decision for anyone who *does*
+want Postgres/a SIEM: implement `AuditSink` yourself against it.
+`SQLiteAuditSink` is the "zero-infra but actually durable" rung between
+`JSONLAuditSink` and "bring your own production DB," not a claim that
+SQLite is the right choice at every scale.
+
+**Hash-chain design.** Each row stores `(kind, timestamp, principal_id,
+data, prev_hash, hash)` where `data` is the entry's own canonical JSON
+(`json.dumps(entry.to_dict(), sort_keys=True)` — the same convention
+`JSONLAuditSink` already uses for its on-disk lines) and `hash =
+sha256(f"{prev_hash}:{data}")`. Chosen over a Merkle tree or a
+signed-log scheme because the threat model here is specifically "did
+someone edit the SQLite file after the fact," which a linear chain
+answers exactly as well as a tree would while being trivial to verify
+sequentially and trivial to reason about — no batching, no
+tree-balancing edge cases. `GENESIS_HASH = "0" * 64` gives `verify()` a
+fixed anchor for record #1 instead of trusting it unconditionally.
+`verify()` returns a structured `ChainVerificationResult` (not an
+exception) so a report generator can state chain integrity as a fact
+without a `try/except` — and stops at the *first* break, since everything
+chained after a broken link inherits its own unprovable-ness. Known,
+stated limitation: this proves tamper-evidence for a single
+`SQLiteAuditSink` file; it does not protect against an attacker with
+full read/write access replaying an *entire* forged chain from
+`GENESIS_HASH` — that needs an external anchor (e.g. periodically
+publishing the latest hash somewhere append-only), out of scope here.
+
+**Report shape.** `reports.py` reads every entry via `entry.to_dict()` +
+its `kind` string, not via `isinstance` against concrete entry classes
+from `models.py`/`tools.py`/`audit.py` — mirrors `marshal_ai/cli.py`'s
+`_summarize`, and keeps a report generator depending on the `AuditSink`/
+`AuditableEvent` contract only. Two report functions instead of one
+combined "compliance report" — different aggregation dimensions
+(jurisdiction/mechanism/controller vs. period/surface/outcome), different
+consumers (DPO doing transfer accounting vs. whoever owns the Article 12
+record), and forcing them into one shape would mean one query parameter
+set doing two unrelated jobs. Both are pure functions of `AuditSink.
+query()`'s output — no writes back to the sink, no hidden state — so they
+compose with any sink, including ones that don't exist yet.
+
+**Why the reports exclude shadow-mode entries from every real
+enforcement figure — see "Audit findings," M2 below for the full failure
+scenario this closes.** In short: `cross_border_data_flow_report` and
+`article12_activity_record` were originally written and tested against
+`marshal_ai/models.py`/`marshal_ai/tools.py` alone, before shadow mode
+existed in the same tree. Once both landed together, a shadow-mode
+"deny"/"require_approval" entry — which never actually blocks anything;
+shadow mode's entire contract is that the real action always proceeds —
+would have been silently counted as a real denial/approval-requirement.
+Neither this module's own tests nor shadow mode's own tests could catch
+this alone; it only appears once both features are exercised against the
+same audit trail, which is exactly the scenario both features' own docs
+recommend (share one sink across every guard). Fixed by reading each
+entry's `shadow` flag and routing shadow entries into a fully separate
+accounting that never touches the real figures — see `ActivityRecord`/
+`CrossBorderDataFlowReport`'s docstrings for the field-level shape.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the
@@ -536,6 +818,71 @@ is exactly the kind of gap SOLID's Open/Closed principle is meant to
 catch: extension should not require the extension author to also go audit
 every existing call site by hand, but it's still worth doing once, here,
 explicitly.
+
+## Audit findings (v0.11 integration pass) — what four parallel branches missed by not seeing each other
+
+v0.11 shipped four features (shadow mode, real vector-store adapters, MCP
+tool-call governance, durable SQLite audit storage + compliance reports)
+built in parallel, each on code that couldn't see the others' changes
+yet. An independent pre-merge review of the assembled tree caught two
+real bugs — both, tellingly, at the *intersection* of two features that
+were each individually correct in isolation.
+
+1. **`sinks.py` imported the private `marshal_ai.audit._decode_entry`.**
+   `SQLiteAuditSink.all_entries`/`query` needed the same "turn a decoded
+   JSON dict back into the right dataclass via its `kind` discriminator"
+   reconstruction `JSONLAuditSink.all_entries` already does in-module —
+   but `audit.py` exposed no public equivalent, and the task that built
+   `sinks.py` had `audit.py` off-limits (parallel work elsewhere touched
+   it). Importing the private helper was the least-bad option available
+   at the time, self-flagged by its own author as the one corner cut.
+   Real violation of the DIP rule this project holds elsewhere: depend on
+   Marshal's *public* abstractions, not another module's private members.
+   Fixed at integration, once `audit.py` was back on the table: added a
+   public `decode_entry(data: dict) -> AuditableEvent` in `audit.py`
+   (thin wrapper delegating to the existing `_decode_entry`), and
+   `sinks.py` now imports the public name. One source of truth for "kind
+   string -> dataclass," publicly reachable from outside `audit.py` for
+   the first time.
+2. **Shadow-mode entries were counted as real enforcement in the
+   compliance reports.** See "Where `SQLiteAuditSink`/`marshal_ai.reports`
+   sit, and why," above, for the full writeup — the short version: a
+   shadow "deny"/"require_approval" entry never actually blocks anything
+   (shadow mode's entire contract is that the real action proceeds
+   regardless), but `reports.py` was written and tested before shadow
+   mode existed in the same tree, so it folded a shadow "deny" straight
+   into `denied`/`denied_transfer_attempts` — numbers a regulator-facing
+   document would read as "this system blocked this," when the system in
+   fact let it through. A secondary defect shared the same root: a shadow
+   `ToolCallEntry`'s raw `outcome == "require_approval"` wasn't in any of
+   the three normalized outcome buckets, so it silently vanished from
+   `outcome_breakdown`'s rollup entirely. Fixed by reading each entry's
+   `shadow` flag and routing shadow entries into `ActivityRecord.
+   shadow_counts`/`shadow_totals` and `CrossBorderDataFlowReport.
+   shadow_observed_calls`/`shadow_would_have_denied_transfers` — fully
+   separate fields, never merged into the real figures, surfaced in their
+   own clearly labeled section in both Markdown renderers — plus adding
+   `"require_approval"` to the approval-outcome bucket set. Regression
+   tests: `test_cross_border_report_excludes_shadow_denies_from_denied_
+   transfer_attempts` and `test_activity_record_excludes_shadow_entries_
+   from_real_counts` in `tests/test_reports.py`.
+
+Neither bug was visible from inside the branch that "caused" it: shadow
+mode's own 16 tests never touch `reports.py`, and `reports.py`'s own
+tests were written and passing before shadow mode's `shadow` field
+existed. Both only appear once the audit trail both features write to is
+actually shared and read back — exactly the integration scenario every
+one of Marshal's own docs recommends (one sink, every guard) and exactly
+why a real merge-time review pass, not just four independently-green
+branches, is the point of the step this file records.
+
+A third item — `RetrievalAuditEntry`, an import-order-fragile way of
+adding shadow's two new fields to the retrieval entry type without
+editing `audit.py` — was flagged SHOULD-FIX rather than MUST-FIX (it
+never actually broke anything the review could reproduce) and is written
+up under "Where shadow mode (`GuardMode`) sits, and why," above, since
+it's a design-simplification rather than a bug with an observable failure
+scenario.
 
 ## Deliberate tradeoffs (considered, not changed)
 

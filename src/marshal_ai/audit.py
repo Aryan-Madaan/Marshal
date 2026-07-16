@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -40,10 +40,46 @@ def _decode_entry(data: dict[str, Any]) -> AuditableEvent:
     return cls(**data)
 
 
+def decode_entry(data: dict[str, Any]) -> AuditableEvent:
+    """Public counterpart to `_decode_entry`: turn a decoded JSON dict
+    (one that still carries its `"kind"` discriminator, exactly what
+    `entry.to_dict()` produces) back into the right dataclass via the
+    `register_entry_type` registry.
+
+    This is the reconstruction half of the self-registering-discriminator
+    mechanism `register_entry_type` already documents as OCP's extension
+    point — `JSONLAuditSink.all_entries` (in this module) and
+    `marshal_ai.sinks.SQLiteAuditSink` (a different module) both need it
+    to round-trip mixed entry types, so it's public: a sink outside
+    `audit.py` should never have to reach into a private helper to do
+    what `audit.py`'s own sink already does internally.
+    """
+    return _decode_entry(data)
+
+
 @dataclass(frozen=True)
 class AuditEntry:
     """A record of one retrieval call — enough to answer "who saw what,
-    and what got filtered out, and why" after the fact."""
+    and what got filtered out, and why" after the fact.
+
+    `shadow` — True when this entry was written by a `RetrievalGuard`
+    running in shadow mode (`marshal_ai.policy.GuardMode`): the policy
+    decision below (`allowed_ids`/`denied_ids`/`denied_reasons`) was
+    computed and audited exactly as in enforce mode, but never acted on
+    — every candidate document was returned to the caller unfiltered and
+    unredacted regardless of what the decision says.
+
+    `would_redact_fields` — for documents the policy would allow, maps
+    document id -> which fields (``"content"`` or a metadata key) its
+    `redact()` would have changed. Field *names* only, matching the
+    existing discipline (`SensitiveDataEntry.findings`,
+    `ToolCallEntry.arguments`) that the audit trail never stores the
+    value a redaction was meant to hide, only what was hidden.
+
+    Both fields default to their enforce-mode-equivalent values (`False`,
+    `{}`) so older JSONL/SQLite logs written before shadow mode existed —
+    and simply lack these two keys — still decode correctly.
+    """
 
     timestamp: float
     principal_id: str
@@ -52,6 +88,8 @@ class AuditEntry:
     allowed_ids: list[str]
     denied_ids: list[str]
     denied_reasons: dict[str, str]
+    shadow: bool = False
+    would_redact_fields: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "retrieval", **asdict(self)}

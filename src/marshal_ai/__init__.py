@@ -5,6 +5,7 @@ from marshal_ai.policy import (
     AttributePolicy,
     FieldRedaction,
     GroupPolicy,
+    GuardMode,
     Policy,
     PolicyDecision,
     Principal,
@@ -55,8 +56,29 @@ from marshal_ai.sensitive import (
     SensitiveDataScanner,
     SensitiveDataToolPolicy,
 )
+from marshal_ai.mcp import GovernedMCPSession
+from marshal_ai.sinks import ChainVerificationResult, GENESIS_HASH, SQLiteAuditSink
+from marshal_ai.reports import (
+    ActivityRecord,
+    CrossBorderDataFlowReport,
+    DataFlowRoute,
+    PeriodActivityCounts,
+    article12_activity_record,
+    cross_border_data_flow_report,
+    render_activity_record_markdown,
+    render_cross_border_markdown,
+    render_json,
+)
 
-__version__ = "0.10.0"
+# `marshal_ai.adapters` (Chroma / LangChain retriever adapters) is
+# deliberately *not* imported here, even though it also has zero
+# import-time dependency on either backend — it's reached via
+# `from marshal_ai.adapters import from_chroma_collection,
+# from_langchain_retriever`, the same submodule-only pattern already
+# used for `marshal_ai.otel` and `marshal_ai.integrations`: optional-
+# backend code stays out of the core namespace, reached one import away.
+
+__version__ = "0.11.0"
 
 __all__ = [
     "AuditableEvent",
@@ -70,6 +92,7 @@ __all__ = [
     "AttributePolicy",
     "FieldRedaction",
     "GroupPolicy",
+    "GuardMode",
     "Policy",
     "PolicyDecision",
     "Principal",
@@ -113,4 +136,17 @@ __all__ = [
     "SensitiveDataPolicy",
     "SensitiveDataScanner",
     "SensitiveDataToolPolicy",
+    "GovernedMCPSession",
+    "ChainVerificationResult",
+    "GENESIS_HASH",
+    "SQLiteAuditSink",
+    "ActivityRecord",
+    "CrossBorderDataFlowReport",
+    "DataFlowRoute",
+    "PeriodActivityCounts",
+    "article12_activity_record",
+    "cross_border_data_flow_report",
+    "render_activity_record_markdown",
+    "render_cross_border_markdown",
+    "render_json",
 ]
