@@ -120,6 +120,15 @@ deletion, or reorder broke. `marshal_ai.reports` derives an EU AI Act
 Article 12-shaped activity record and a cross-border data-flow report
 straight from that same audit trail. See below.
 
+Plus **policy-as-config** (`marshal_ai.load_policies`) — every policy
+above is a Python object, so a compliance reviewer who isn't a Python
+engineer couldn't audit or propose a governance change without reviewing
+application code, and a policy change couldn't ship separately from a
+code deploy. `load_policies` builds the exact same policy objects from a
+YAML or JSON file — a thin translation layer, not a new rules language,
+so it can't express anything the policy classes themselves can't. See
+below.
+
 See [`ideas.md`](./ideas.md) for what's next: a litellm proxy hook for
 deployments already running the LiteLLM proxy, and adapters for
 Pinecone/pgvector/Weaviate.
@@ -594,6 +603,60 @@ real allowed/denied/approval-required or cross-border transfer figures
 these reports exist to get right. Run `python
 examples/compliance_report_example.py` for a full end-to-end walkthrough.
 
+## Quickstart: policy as config
+
+Keep governance rules in a reviewable, diffable file instead of
+application code. YAML needs the optional extra (`pip install -e
+".[config]"`); JSON works with no extra dependency.
+
+```yaml
+# policies.yaml
+version: 1
+tool_policy:
+  base: {type: risk_tier, tiers: {low: allow, medium: require_approval, high: deny}}
+  wrappers:
+    - {type: rate_limit, max_calls: 100, window_seconds: 60}
+    - type: jurisdictional_risk_tier
+      overrides_by_jurisdiction: {EU: {employment_decision: require_approval}}
+model_policy:
+  base:
+    type: allowlist
+    routes:
+      default-chat-model:
+        - {model: gpt-fast}
+        - {model: eu-hosted, requires_attribute: "region:eu"}
+  wrappers:
+    - {type: budget, pricing: {gpt-fast: [0.5, 1.5], eu-hosted: [0.8, 2.0]}, limit_usd: 5.0}
+```
+
+```python
+from marshal_ai import ModelGuard, ToolGuard, load_policies
+
+policies = load_policies("policies.yaml")  # or .json, or an already-parsed dict
+tool_guard = ToolGuard(tool=my_tool, policy=policies.tool_policy, audit_sink=sink)
+model_guard = ModelGuard(policy=policies.model_policy, audit_sink=sink)
+```
+
+Each surface (`retrieval_policy`/`tool_policy`/`model_policy`) is a
+`base` policy plus an ordered `wrappers` list. The first wrapper wraps
+`base` directly, and each later one wraps the result, the same nesting
+you'd write by hand. A surface absent from the file comes back as `None`,
+leaving that guard's own default. Every built policy is an ordinary
+object, so anything that needs a real Python callable rather than data
+(a custom `SensitiveDataScanner`, an audit sink for `sensitive_data`
+findings, an `ApprovalHandler`) is composed around it in code. Register
+your own policy types with `register_builder`.
+
+It fails closed: an unknown key or type, a mistyped or missing param, a
+wrapper in the base slot, an unreadable file, or invalid YAML/JSON all
+raise `PolicyConfigError` naming the exact path (e.g.
+`model_policy.wrappers[1]: unknown type 'residencyy'`). There is never a
+silent fallback to an allow-all policy or a partially loaded result.
+YAML is parsed with `yaml.safe_load` only. See `marshal_ai/config.py`'s
+docstring for every supported type and param, and run `python
+examples/policy_as_config_example.py` for retrieval, tool, and model
+policies loaded from `examples/policies.yaml` into one shared audit trail.
+
 ## How it works
 
 ### Retrieval (`RetrievalGuard`)
@@ -806,7 +869,7 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.11 — all three governance surfaces (retrieval; tool calls with rate
+v0.12 — all three governance surfaces (retrieval; tool calls with rate
 limiting, runaway-loop detection, and jurisdiction-aware risk tiering;
 model routing/budgets/cross-border data residency/data retention/
 reliability-aware circuit breaking), one shared audit trail, OpenTelemetry
@@ -815,7 +878,9 @@ OpenAI/Anthropic/Google-GenAI-based framework via SDK patching (with
 automatic outcome/latency reporting) — including Google ADK's default
 Gemini path specifically, verified against ADK's own source rather than
 assumed — and deterministic sensitive-data detection across every
-surface. New this release: an observe-first `mode="shadow"` on every
+surface. New this release: policy-as-config (`load_policies` builds
+Marshal's existing policies from a reviewable YAML/JSON file, fail-closed
+on any malformed input). New in v0.11: an observe-first `mode="shadow"` on every
 guard; real Chroma and LangChain adapters for `RetrievalGuard` (Chroma
 integration is shipped, no longer in progress); MCP tool-call governance
 (`marshal_ai.mcp.GovernedMCPSession`) — the shared choke point every
@@ -827,8 +892,7 @@ is never counted as a real one. See [`ideas.md`](./ideas.md) for what's
 next (time-to-first-token tracking for streaming calls; an N-failed-calls
 trigger for `RunawayAgentPolicy` once `ToolGuard` reports call outcomes
 the way `ModelGuard` does; a litellm proxy hook for deployments already
-running the LiteLLM proxy; adapters for Pinecone/pgvector/Weaviate;
-policy-as-config).
+running the LiteLLM proxy; adapters for Pinecone/pgvector/Weaviate).
 
 ## License
 

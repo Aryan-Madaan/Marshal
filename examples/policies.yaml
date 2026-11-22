@@ -1,0 +1,70 @@
+# A realistic multi-surface Marshal policy config — see the
+# "Policy as config" quickstart in README.md and marshal_ai/config.py's
+# module docstring for the full schema. Loaded end-to-end by
+# policy_as_config_example.py.
+#
+# This file is meant to be the reviewable, diffable artifact a compliance
+# reviewer who isn't a Python engineer can read, propose a change to, and
+# get approved in a PR — separate from any application code deploy.
+version: 1
+
+retrieval_policy:
+  base:
+    type: attribute
+    default: allow
+  wrappers:
+    # Regardless of who's allowed to see a document, redact anything that
+    # looks like a secret/PII in its content.
+    - type: sensitive_data
+
+tool_policy:
+  base:
+    type: risk_tier
+    tiers:
+      low: allow
+      medium: require_approval
+      high: deny
+      # Base policy alone treats this the same as any other low-oversight
+      # action — it's the jurisdictional_risk_tier wrapper below that adds
+      # mandatory human oversight specifically in the EU.
+      employment_decision: allow
+  wrappers:
+    # No principal may call anything more than 100 times a minute,
+    # regardless of what any individual call resolves to.
+    - type: rate_limit
+      max_calls: 100
+      window_seconds: 60
+    # employment_decision, which the base policy allows everywhere,
+    # requires human approval specifically in the EU (EU AI Act Annex III
+    # territory) — monotonic, this can only add oversight, never remove it.
+    - type: jurisdictional_risk_tier
+      overrides_by_jurisdiction:
+        EU:
+          employment_decision: require_approval
+
+model_policy:
+  base:
+    type: allowlist
+    routes:
+      default-chat-model:
+        - model: gpt-fast
+        - model: eu-hosted
+          requires_attribute: "region:eu"
+  wrappers:
+    # $ per 1K prompt / completion tokens — illustrative, not real pricing.
+    - type: budget
+      pricing:
+        gpt-fast: [0.5, 1.5]
+        eu-hosted: [0.8, 2.0]
+      limit_usd: 5.0
+    # Only a request explicitly carrying EU-governed data may resolve to
+    # the EU deployment, and only via a documented transfer mechanism.
+    # ResidencyPolicy fails closed on ANY jurisdiction not listed here —
+    # US-governed data is covered too, so a purely domestic call isn't
+    # denied just because it never crosses a border.
+    - type: residency
+      allowed_by_jurisdiction:
+        US:
+          gpt-fast: internal_processing
+        EU:
+          eu-hosted: adequacy_decision

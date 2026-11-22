@@ -1,4 +1,5 @@
 from marshal_ai.audit import AuditableEvent, AuditEntry, AuditSink, InMemoryAuditSink, JSONLAuditSink
+from marshal_ai.config import LoadedPolicies, PolicyConfigError, load_policies, register_builder
 from marshal_ai.retrieval import Document, RetrievalGuard
 from marshal_ai.policy import (
     AllowAll,
@@ -78,7 +79,7 @@ from marshal_ai.reports import (
 # used for `marshal_ai.otel` and `marshal_ai.integrations`: optional-
 # backend code stays out of the core namespace, reached one import away.
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 __all__ = [
     "AuditableEvent",
@@ -86,6 +87,10 @@ __all__ = [
     "AuditSink",
     "InMemoryAuditSink",
     "JSONLAuditSink",
+    "LoadedPolicies",
+    "PolicyConfigError",
+    "load_policies",
+    "register_builder",
     "Document",
     "RetrievalGuard",
     "AllowAll",

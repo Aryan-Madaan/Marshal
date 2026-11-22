@@ -1,7 +1,7 @@
 [project]
 name = "marshal-ai"
-version = "0.11.0"
-description = "Governance for AI systems: permission-aware retrieval (with real Chroma/LangChain vector-store adapters) backed by an observe-first shadow mode, tool-call approval with rate limiting/jurisdictional risk tiering (including MCP tool-call governance), model routing/budgets/data-residency/reliability, and a durable, tamper-evident audit trail with EU AI Act-shaped compliance reports — one library, one place to see what happened."
+version = "0.12.0"
+description = "Governance for AI systems: permission-aware retrieval (with real Chroma/LangChain vector-store adapters) backed by an observe-first shadow mode, tool-call approval with rate limiting/jurisdictional risk tiering (including MCP tool-call governance), model routing/budgets/data-residency/reliability, a durable, tamper-evident audit trail with EU AI Act-shaped compliance reports, and policy-as-config (YAML/JSON) for Marshal's existing composable policies — one library, one place to see what happened."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Aryan Madaan" }]
@@ -34,6 +34,7 @@ dev = [
     "chromadb>=0.4",
     "langchain-core>=0.3",
     "mcp>=1.0",
+    "pyyaml>=6",
 ]
 chroma = ["chromadb>=0.4"]
 langchain = ["langchain-core>=0.3"]
@@ -42,6 +43,7 @@ opentelemetry = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 openai = ["openai>=1.0"]
 anthropic = ["anthropic>=0.30"]
 google-genai = ["google-genai>=1.0"]
+config = ["pyyaml>=6"]
 
 [build-system]
 requires = ["hatchling"]

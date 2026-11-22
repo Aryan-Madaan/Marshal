@@ -304,7 +304,7 @@ just what's in the request. That's the actual dividing line between
 "library" and "platform" — a feedback loop, not a wider set of static
 policy shapes — and it's still a library by that definition: no central
 config store, no cross-process state, no dashboard. Policy-as-config
-(tracked in `ideas.md`) is the other missing piece, not this one.
+(shipped in v0.12, see below) is the other missing piece, not this one.
 
 **Decision point — `record_outcome` as a new, separate reporting path,
 not folded into `record_usage`.** `record_usage` is called only on
@@ -745,10 +745,82 @@ entry's `shadow` flag and routing shadow entries into a fully separate
 accounting that never touches the real figures — see `ActivityRecord`/
 `CrossBorderDataFlowReport`'s docstrings for the field-level shape.
 
+## Where `marshal_ai.config` (policy-as-config) sits, and why
+
+**Decision point — a translation layer, not a rules engine.** The obvious
+precedent is OPA/Rego: policies in their own language, evaluated by their
+own engine. Rejected for Marshal because a second evaluator is a second
+place governance logic lives, and the two can drift. A Rego-style rule
+that the Python classes can't express would mean either a silent gap
+(config says deny, nothing enforces it) or a parallel implementation that
+has to be kept identical to the real one forever. `load_policies` instead
+deserializes into the exact `AttributePolicy`/`RiskTierPolicy`/etc.
+objects code would construct, and lets each constructor's own validation
+(`AttributePolicy`'s `default` check, `RiskTierPolicy`'s outcome check)
+do the rejecting. Constructor `ValueError`/`TypeError`s are re-raised as
+`PolicyConfigError` with the config path prefixed, still the
+constructor's check doing the work. The cost is stated plainly: config
+can only express what the classes already can. That is the point, not a
+limitation to grow out of.
+
+**Decision point — `base` + ordered `wrappers`, not arbitrary nesting.**
+Every non-base policy in Marshal is a decorator taking `base` as its
+first argument, so a chain is the only shape there is. A flat list reads
+top-to-bottom in a diff (what a compliance reviewer actually looks at)
+where a nested `{type: residency, base: {type: budget, base: ...}}` tree
+gets deeper with every rule. Order is first-wraps-base, matching hand
+nesting. Each registry entry records its role, so a wrapper in the base
+slot, or a base in `wrappers`, fails with a message saying which slot it
+belongs in rather than a `TypeError` about a missing argument.
+
+**Decision point — what stays Python-only.** Anything that's an object or
+callable rather than data: custom `SensitiveDataScanner` detector regexes,
+`audit_sink` instances, `ApprovalHandler`s, custom policy subclasses.
+Detector regexes were the closest call. A list of strings is easy to put
+in YAML, but it's arbitrary pattern logic authored outside code review,
+i.e. a DSL by another name. Narrowing *which* built-in detectors block a
+tool call (`block_detectors`) is supported, since that's a subset of
+known names validated against `DEFAULT_DETECTORS`. Custom policy types
+are reachable through `register_builder` (the same self-registering idiom
+as `register_entry_type`), so the escape hatch is code, reviewed as code.
+
+**Decision point — fail closed on every malformed input, and one
+exception type.** A governance config that half-loads is worse than one
+that doesn't load: the operator believes rules are in force that aren't.
+So every problem raises before anything is returned. Unknown keys are
+rejected rather than ignored, because a typo'd `wrapers:` that's silently
+skipped drops every wrapper. Everything surfaces as `PolicyConfigError`
+so a deployment can catch one type at startup and refuse to boot. An
+absent surface key is the one non-error: it returns `None`, not an
+allow-all stand-in, so the caller decides what absence means.
+
+**Decision point — YAML optional, `safe_load` only.** JSON is stdlib and
+always available. PyYAML is a `[config]` extra imported only when a
+`.yaml`/`.yml` file is loaded, keeping the core install dependency-free.
+A missing PyYAML raises `PolicyConfigError` with the install command.
+`yaml.safe_load` is used unconditionally: a policy file is exactly the
+kind of input that passes through many hands, and `yaml.load` can
+construct arbitrary Python objects. An optional `version: 1` key is
+reserved so a future incompatible schema change is rejected loudly
+rather than misparsed.
+
+**Audit findings (pre-commit pass).** Two contract violations, both
+fixed with regression tests: (1) a missing or non-UTF-8 config file
+escaped as a raw `FileNotFoundError`/`UnicodeDecodeError`, breaking the
+"catch one type" promise above; file reads now go through one helper that
+wraps `OSError`/`UnicodeDecodeError`. (2) `version: true` and
+`version: 1.0` passed `version != 1` because `True == 1 == 1.0` in
+Python; the check now requires an actual `int`. Also corrected a comment
+in `examples/policies.yaml` that claimed the base tool policy already
+denies `employment_decision` (it allows it; the EU wrapper is what adds
+approval).
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the
   shared audit trail — new event kinds opt in without touching `audit.py`.
+  `marshal_ai.config.register_builder` reuses the same shape for loadable
+  policy types.
 - **Strategy via constructor injection** — every `*Policy` base class is
   the strategy interface; `RedactingPolicy`/`BudgetPolicy`/
   `SensitiveDataPolicy` are all "wrap a strategy, add one behavior,

@@ -257,7 +257,7 @@ is static config plus the current request. `CircuitBreakerPolicy` is the
 second policy (after `BudgetPolicy`) whose decision depends on accumulated
 runtime history. Genuinely more platform-shaped than what came before it,
 but still a library: no central config store, no cross-process
-aggregation, no dashboard. Policy-as-config (below) is the other missing
+aggregation, no dashboard. Policy-as-config (shipped in v0.12, below) is the other missing
 piece of that story, not this one.
 
 - **v0.10 — native Google GenAI (Gemini) support in `marshal_ai.integrations`,
@@ -474,6 +474,39 @@ piece of that story, not this one.
   to one `SQLiteAuditSink` file aren't coordinated (each process caches
   its own chain tip); route writes through a single process if that
   matters for your deployment.
+- **v0.12 — policy-as-config (`marshal_ai.config`).** Closes the backlog
+  item of the same name: every policy through v0.11 was a Python object,
+  so a compliance reviewer who isn't a Python engineer couldn't audit or
+  propose a governance change without a code review, and a policy change
+  couldn't be versioned or approved separately from a deploy.
+  `load_policies(path_or_dict)` reads YAML or JSON and builds the *same*
+  `AttributePolicy`/`RiskTierPolicy`/`AllowlistModelPolicy`/wrapper
+  objects you'd construct by hand. Each surface is a `base` plus an
+  ordered `wrappers` list, applied innermost-first to match hand nesting.
+  Deliberately a thin translation layer, not a DSL: it never re-implements
+  a policy's logic and leans on each constructor's own invariant checks,
+  so a config can't express anything the classes can't, and a governance
+  bypass would need a bug in both this module and the policy class.
+  Fail-closed throughout: every malformed input (unknown key/type, wrong
+  param type, a wrapper in the base slot, an unreadable file, invalid
+  YAML/JSON, an unsupported `version`) raises `PolicyConfigError` naming
+  the offending path, never a partial result or an allow-all fallback.
+  PyYAML is an optional `[config]` extra imported lazily, `safe_load`
+  only. New types plug in via `register_builder`, the same
+  self-registering idiom as `register_entry_type`.
+  **Left Python-only, on purpose**: anything that needs a real callable
+  or object rather than data — custom `SensitiveDataScanner` regexes, an
+  `audit_sink` for `sensitive_data` findings, `ApprovalHandler`s, custom
+  policy subclasses — stays in code, composed around the loaded policy.
+  Authoring detector regexes in config is exactly the "new DSL" this
+  refuses to become. One stated gap: a config-built `sensitive_data`
+  wrapper still redacts/blocks correctly but has no sink, so it doesn't
+  write separate `SensitiveDataEntry` records.
+  **Fixed in the pre-commit pass**: a missing or non-UTF-8 file escaped
+  as a raw `OSError`/`UnicodeDecodeError` despite the "only
+  `PolicyConfigError`" contract, and `version: true`/`version: 1.0`
+  passed the version check because `True == 1` in Python. Both now raise
+  `PolicyConfigError`, with regression tests.
 
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
@@ -570,17 +603,6 @@ keeping each surface's scope maximally narrow.
   awkward multiple inheritance, so this would be a second, `ModelPolicy`-
   side class (distinctly named, e.g. `ModelRateLimitPolicy`), not a
   one-line reuse of the `ToolGuard` version.
-
-- **Policy-as-config (YAML/JSON).** Every policy today is a Python object,
-  which means a compliance reviewer who isn't a Python engineer can't audit
-  or propose a policy change without going through a PR review of code, and
-  a policy change can't be versioned/approved separately from a code
-  deploy. A loader that builds `AttributePolicy`/`RiskTierPolicy`/
-  `AllowlistModelPolicy`/`SensitiveDataPolicy` (and the wrapping
-  `Redacting*`/`SensitiveData*` layers) from a declarative file would let
-  governance rules live in a reviewable, diffable artifact separate from
-  application code — the OPA/Rego precedent, scoped to what Marshal's
-  existing policy shapes can already express rather than a new DSL.
 
 Add more here as they come up — pain points from real work beat cold-cloned ideas.
 
