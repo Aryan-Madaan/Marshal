@@ -35,27 +35,30 @@ across every framework built on the openai/anthropic/google-genai SDKs.
         # a call to "delete_database" raises ToolCallDenied instead —
         # the real server never sees that request.
 
-Verified against the installed `mcp` SDK (1.28.1) before writing a line
-of this module, not assumed from memory:
+Verified against the installed `mcp` SDK (2.3.0, protocol revision
+2026-07-28) before writing a line of this module, not assumed from memory:
 
-- `mcp.ClientSession.call_tool(name, arguments=None, read_timeout_seconds=
-  None, progress_callback=None, *, meta=None) -> mcp.types.CallToolResult`
-  is a coroutine (`mcp/client/session.py`). `CallToolResult` carries
-  `content: list[ContentBlock]`, `structuredContent: dict | None`, and
-  `isError: bool = False` — the SDK's own shape for "the tool ran and
-  failed" (`mcp/types.py`).
-- `mcp.ClientSession.list_tools(...) -> mcp.types.ListToolsResult` is
-  also a coroutine; listing isn't a call (no arguments, no side effect),
-  so it isn't governed here — see `GovernedMCPSession` below.
-- `mcp.shared.memory.create_connected_server_and_client_session(server)`
-  is the SDK's own in-process client<->server transport — an
-  `@asynccontextmanager` that spins up a real `mcp.server.lowlevel.Server`
-  (or `mcp.server.fastmcp.FastMCP`) on one end and a real `ClientSession`
-  on the other, connected by `anyio` memory object streams, no socket or
-  subprocess involved. This is what `tests/test_mcp.py` and
-  `examples/mcp_governance_example.py` stand a real server up on, and
-  what makes those tests exercise the real SDK's request/response
-  machinery rather than a hand-rolled stand-in for it.
+- mcp 2 has two client shapes, and `GovernedMCPSession` wraps either:
+  the high-level `mcp.Client` (which negotiates the protocol, retries
+  multi-round-trip `input_required` results itself, and connects
+  in-process to an `MCPServer` for tests) and the lower-level
+  `mcp.ClientSession` (`client.session`). Both expose `call_tool(name,
+  arguments=None, read_timeout_seconds=None, progress_callback=None, *,
+  ...)` and `list_tools(...)` as coroutines; the keyword-only tail
+  differs between them and between SDK releases (`input_responses`,
+  `request_state`, `meta`, `allow_input_required`, ...), so every
+  argument after `arguments` is forwarded verbatim rather than mirrored.
+- `CallToolResult` carries `content`, `structured_content`, and
+  `is_error` (mcp 2 renamed the 1.x camelCase fields). `Tool` carries
+  `name`, `title`, `description`, `input_schema`, `output_schema`, and
+  `annotations` — what `tool_fingerprint` hashes.
+- The 2026-07-28 revision removed the `initialize` handshake and
+  sessions; nothing here depended on either. Multi round-trip requests
+  re-send `tools/call` with `input_responses`: through `mcp.Client` that
+  retry loop happens inside one governed `call_tool`; driving it yourself
+  on a raw `ClientSession` governs each round as its own call (fail
+  closed — a policy is never skipped because a request claims to be a
+  continuation).
 
 Deliberately imports nothing from `mcp` at module scope (only inside a
 `TYPE_CHECKING` block, for annotations). `GovernedMCPSession` never
@@ -64,8 +67,8 @@ constructs or type-checks a `ClientSession` itself — it only ever awaits
 forwards everything else via `__getattr__` — so `import marshal_ai.mcp`
 succeeds with zero dependency on the `mcp` package actually being
 installed, matching the rest of `marshal_ai`'s zero required
-dependencies (`pyproject.toml`'s `dependencies = []`; `mcp` should be an
-optional extra, same as `openai`/`anthropic`/`google-genai` already are)
+dependencies (`pyproject.toml`'s `dependencies = []`; `mcp` is an
+optional extra, same as `openai`/`anthropic`/`google-genai`)
 and the same lazy-import discipline `marshal_ai.integrations` already
 uses (it imports `openai`/`anthropic`/`google.genai` inside each
 `enable_*` function, never at that module's top). Constructing a *real*
@@ -90,111 +93,307 @@ own boundary and translate it in one line; that's a one-directional,
 caller-side choice, not something worth baking into Marshal's own
 denial semantics. `ToolCallDenied` is re-exported from `marshal_ai.tools`
 (and top-level `marshal_ai`) already — nothing new to import here.
+
+Tool-definition pinning (`MCPToolPins`) — the defense against MCP "rug
+pulls" (a server changing a tool's description or schema after it was
+reviewed, so the model reads new, attacker-written instructions) and
+tool shadowing (a second server registering a tool name that another
+server already provides). `tool_fingerprint` is a SHA-256 over the
+canonical JSON of everything a model reads about a tool. Pass a shared
+`MCPToolPins` to every `GovernedMCPSession` and give each one a stable
+`server_id`: the first time a tool is seen it's pinned (trust on first
+use, or `on_new="deny"` to require pre-approved pins); afterwards a
+changed definition is hidden from `list_tools()` and refused by
+`call_tool()` until someone calls `pins.approve(...)`, and a name already
+pinned under a different server is treated the same way. Stated limit:
+pinning catches a definition that *changes*; it cannot tell you a
+definition was malicious the first time you saw it — review new tools
+before pinning them, which is what `on_new="deny"` is for.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Optional
+import hashlib
+import json
+import os
+import tempfile
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
-from marshal_ai.audit import AuditSink, InMemoryAuditSink
-from marshal_ai.policy import Principal
-from marshal_ai.tools import ApprovalHandler, CLIApprovalHandler, ToolGuard, ToolPolicy
+from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
+from marshal_ai.policy import GuardMode, Principal
+from marshal_ai.tools import (
+    _snapshot,
+    ApprovalHandler,
+    CLIApprovalHandler,
+    ToolCallRequest,
+    ToolDecision,
+    ToolGuard,
+    ToolPolicy,
+)
 
 if TYPE_CHECKING:
-    from mcp import ClientSession
-    from mcp.shared.session import ProgressFnT
     from mcp.types import CallToolResult, ListToolsResult
 
 
-class GovernedMCPSession:
-    """Wraps a real, already-connected `mcp.ClientSession` so every
-    `call_tool(name, arguments)` is evaluated by a Marshal `ToolPolicy`
-    *before* the underlying `tools/call` request is forwarded to the MCP
-    server. A denied or declined call never reaches the server (fail
-    closed) and is still audited either way — same discipline `ToolGuard`
-    already applies to a bare Python callable.
+# The fields a model actually reads about a tool. `meta`/`icons`/
+# `execution` are transport/UI details, not instructions to the model.
+_FINGERPRINT_FIELDS = ("name", "title", "description", "input_schema", "output_schema", "annotations")
 
-    One `GovernedMCPSession` is bound to one `principal` at construction,
-    unlike `ToolGuard.call(principal, ...)`, which takes a principal per
-    call. That's a deliberate difference, not an inconsistency: a real
-    MCP client session is already scoped to one connected identity (one
-    connection, one set of credentials) the way a bare Python callable
-    wrapped by `ToolGuard` structurally is not — so binding the principal
-    once, at the point where the session itself was already established,
-    matches what a session *is* instead of re-deriving it on every call.
 
-    `risk_tiers` maps MCP tool name -> risk tier (the same tier
-    vocabulary `RiskTierPolicy`/`JurisdictionalRiskTierPolicy` already key
-    on) — the "tool name -> risk tier comes from policy config" lookup
-    that `ToolGuard` itself never had to provide, since it's constructed
-    around exactly one already-named tool. A tool absent from `risk_tiers`
-    falls back to `default_risk_tier`; either can be overridden per call
-    via `call_tool(..., risk_tier=...)` for a one-off exception without
-    reconstructing the whole session.
+def _tool_field(tool: Any, name: str) -> Any:
+    if isinstance(tool, dict):
+        return tool.get(name)
+    value = getattr(tool, name, None)
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json", exclude_none=True)
+    return value
 
-    Only `call_tool` is governed. Every other `ClientSession` method
-    (`list_resources`, `read_resource`, `get_prompt`, `initialize`, …)
-    passes straight through via `__getattr__` — listing/reading
-    capabilities carries no arguments and no side effect on the server,
-    so there is nothing here for a `ToolPolicy` to evaluate; `tools/call`
-    is MCP's only action surface. This is also why `GovernedMCPSession`
-    doesn't reimplement `async with` — wrap an already-`__aenter__`'d
-    session (see the module docstring's example, and `tests/test_mcp.py`),
-    don't hand it an unopened one.
 
-    Reuses `ToolGuard` itself for the evaluate -> redact -> (approve) ->
-    audit -> dispatch sequence — not just its constituent types — despite
-    `ToolGuard.call()` being synchronous and `ClientSession.call_tool`
-    being a coroutine function. The mechanism: calling a Python
-    `async def` function does not run its body, it only ever returns a
-    coroutine object — so `ToolGuard(tool=lambda **kw:
-    self._session.call_tool(name, kw, ...), ...).call(principal,
-    arguments, risk_tier=..., context=...)` runs `ToolGuard.call()`'s
-    entire existing code path synchronously and unmodified (evaluate,
-    redact, approval, audit), and on the allow/approved path its final
-    line, `return self._tool(**arguments)`, merely *constructs* — without
-    running — the real `call_tool` coroutine, which `GovernedMCPSession.
-    call_tool` then awaits itself. On the deny/declined path,
-    `ToolGuard.call()` raises `ToolCallDenied` before ever reaching
-    `self._tool(...)` — so the coroutine representing the real request is
-    never constructed, let alone sent; nothing to cancel, nothing that
-    could accidentally fire. A fresh `ToolGuard` is built per call because
-    `tool_name` — and the closure capturing which tool to invoke — varies
-    per call, unlike a single long-lived `ToolGuard` wrapping one fixed
-    callable; `ToolGuard.__init__` only stores references (no I/O), so
-    this adds one cheap object per call, not a second copy of any
-    governance logic.
+def tool_fingerprint(tool: Any) -> str:
+    """SHA-256 (hex) over the canonical JSON of a tool's model-visible
+    definition: name, title, description, input/output schema, and
+    annotations. Works on an `mcp.types.Tool` or a plain dict."""
+    payload = {name: _tool_field(tool, name) for name in _FINGERPRINT_FIELDS}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+PinStatus = Literal["verified", "pinned_new", "changed", "unpinned", "shadowed"]
+
+
+@dataclass(frozen=True)
+class PinCheck:
+    status: PinStatus
+    expected: Optional[str]  # the pinned fingerprint, if any
+    actual: str
+    shadowed_server: Optional[str] = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.status in ("changed", "unpinned", "shadowed")
+
+
+class MCPToolPins:
+    """Pinned tool fingerprints, keyed by server id then tool name.
+    Thread-safe; persisted to `path` (JSON, written atomically) when one
+    is given, so pins survive restarts and can be committed and reviewed
+    like any other policy file.
+
+    `on_new` — what happens the first time a tool is seen: `"pin"` (trust
+    on first use; the default) or `"deny"` (only pre-approved pins pass).
+    `on_shadowed` — a tool name already pinned under a *different* server:
+    `"deny"` (the default) or `"allow"`.
     """
 
     def __init__(
         self,
-        session: "ClientSession",
+        path: "str | Path | None" = None,
+        on_new: Literal["pin", "deny"] = "pin",
+        on_shadowed: Literal["deny", "allow"] = "deny",
+    ) -> None:
+        if on_new not in ("pin", "deny"):
+            raise ValueError("on_new must be 'pin' or 'deny'")
+        if on_shadowed not in ("deny", "allow"):
+            raise ValueError("on_shadowed must be 'deny' or 'allow'")
+        self._path = Path(path) if path is not None else None
+        self._on_new = on_new
+        self._on_shadowed = on_shadowed
+        self._lock = threading.Lock()
+        self._pins: dict[str, dict[str, str]] = {}
+        if self._path is not None and self._path.exists():
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or not all(
+                isinstance(tools, dict) and all(isinstance(v, str) for v in tools.values())
+                for tools in raw.values()
+            ):
+                raise ValueError(f"{self._path}: expected {{server_id: {{tool_name: fingerprint}}}}")
+            self._pins = {server: dict(tools) for server, tools in raw.items()}
+
+    def pins(self) -> dict[str, dict[str, str]]:
+        with self._lock:
+            return {server: dict(tools) for server, tools in self._pins.items()}
+
+    def _save_locked(self) -> None:
+        if self._path is None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self._path.parent, prefix=".pins-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self._pins, f, indent=2, sort_keys=True)
+            os.replace(tmp, self._path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+    def approve(self, server_id: str, tool_name: str, fingerprint: str) -> None:
+        """Pin (or re-pin, after reviewing a changed definition) a tool —
+        the explicit human step a changed definition requires."""
+        with self._lock:
+            self._pins.setdefault(server_id, {})[tool_name] = fingerprint
+            self._save_locked()
+
+    def revoke(self, server_id: str, tool_name: str) -> None:
+        with self._lock:
+            self._pins.get(server_id, {}).pop(tool_name, None)
+            self._save_locked()
+
+    def check(self, server_id: str, tool: Any) -> PinCheck:
+        name = _tool_field(tool, "name")
+        actual = tool_fingerprint(tool)
+        with self._lock:
+            expected = self._pins.get(server_id, {}).get(name)
+            if expected is None:
+                # Shadow check only for a tool this server has no pin for:
+                # a name a human explicitly approved on two servers via
+                # approve() is a reviewed decision, not shadowing.
+                if self._on_shadowed == "deny":
+                    for other, tools in self._pins.items():
+                        if other != server_id and name in tools:
+                            return PinCheck("shadowed", None, actual, shadowed_server=other)
+                if self._on_new == "deny":
+                    return PinCheck("unpinned", None, actual)
+                self._pins.setdefault(server_id, {})[name] = actual
+                self._save_locked()
+                return PinCheck("pinned_new", None, actual)
+            if expected != actual:
+                return PinCheck("changed", expected, actual)
+            return PinCheck("verified", expected, actual)
+
+
+@dataclass(frozen=True)
+class MCPToolDefinitionEntry:
+    """A tool definition that was newly pinned, or refused because it
+    changed, was never approved, or shadows another server's tool.
+    Fingerprints are truncated to 16 hex characters — enough to tell
+    definitions apart in a review, without the log becoming a lookup
+    table. Verified (unchanged) tools aren't logged on every listing."""
+
+    timestamp: float
+    principal_id: str
+    server_id: str
+    tool_name: str
+    status: str  # PinStatus
+    action: str  # "pinned" | "hidden" | "audited_only"
+    expected_fingerprint: Optional[str] = None
+    actual_fingerprint: Optional[str] = None
+    shadowed_server: Optional[str] = None
+    shadow: bool = False
+    on_behalf_of: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": "mcp_tool_definition", **asdict(self)}
+
+
+register_entry_type("mcp_tool_definition", MCPToolDefinitionEntry)
+
+
+class _DefinitionGate(ToolPolicy):
+    """Puts a definition-check verdict in front of the real policy, so a
+    refused tool goes through `ToolGuard`'s ordinary deny path (one audit
+    shape, shadow mode honored) rather than a separate code path."""
+
+    def __init__(self, base: Optional[ToolPolicy], blocked_reason: Optional[str]) -> None:
+        from marshal_ai.tools import AllowAllTools
+
+        self._base = base if base is not None else AllowAllTools()
+        self._blocked_reason = blocked_reason
+
+    def evaluate(self, request: ToolCallRequest) -> ToolDecision:
+        if self._blocked_reason is not None:
+            return ToolDecision("deny", self._blocked_reason)
+        return self._base.evaluate(request)
+
+    def redact_arguments(self, request: ToolCallRequest) -> dict[str, Any]:
+        return self._base.redact_arguments(request)
+
+
+def _blocked_reason(check: PinCheck) -> str:
+    if check.status == "changed":
+        return (
+            f"tool definition changed since it was pinned ({check.expected[:16]} -> "
+            f"{check.actual[:16]}) — re-approve it with MCPToolPins.approve() after review"
+        )
+    if check.status == "shadowed":
+        return f"tool name is already provided by MCP server {check.shadowed_server!r} (tool shadowing)"
+    return "tool definition is not pinned and this session only allows pre-approved tools"
+
+
+def _annotations_dict(tool: Any) -> dict[str, Any]:
+    value = _tool_field(tool, "annotations")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+class GovernedMCPSession:
+    """Wraps a real, already-connected `mcp.Client` or `mcp.ClientSession`
+    so every `call_tool(name, arguments)` is evaluated by a Marshal
+    `ToolPolicy` *before* the underlying `tools/call` request is forwarded
+    to the MCP server. A denied or declined call never reaches the server
+    (fail closed) and is still audited either way — same discipline
+    `ToolGuard` already applies to a bare Python callable.
+
+    One `GovernedMCPSession` is bound to one `principal` at construction
+    (use `Principal(..., on_behalf_of=...)` for an agent acting for a
+    user), because a real MCP connection is already scoped to one
+    identity. `risk_tiers` maps MCP tool name -> risk tier (the same
+    vocabulary `RiskTierPolicy` keys on); a tool absent from it falls back
+    to `default_risk_tier`, and either can be overridden per call via
+    `call_tool(..., risk_tier=...)`.
+
+    `server_id` names this server in the audit trail and in `tool_pins`.
+    Every call's `context` also carries `mcp_server` and the tool's
+    `mcp_annotations` (when the tool has been listed), so policies such as
+    `marshal_ai.flow.LethalTrifectaPolicy` can use them.
+
+    `list_tools()` is governed only when `tool_pins` is given (see the
+    module docstring): tools whose definitions fail the pin check are
+    removed from the listing, so the model never reads a changed
+    description. Every other method (`list_resources`, `read_resource`,
+    `get_prompt`, …) passes straight through via `__getattr__`.
+    `mode="shadow"` audits every decision — policy and pin checks alike —
+    without hiding or refusing anything.
+
+    Reuses `ToolGuard.authorize()` for the evaluate -> redact -> (approve)
+    -> audit sequence, then awaits the real request only once that
+    returns; on deny/declined it raises `ToolCallDenied` before the
+    request coroutine is ever created.
+    """
+
+    def __init__(
+        self,
+        session: Any,
         principal: Principal,
         policy: Optional[ToolPolicy] = None,
         risk_tiers: Optional[dict[str, str]] = None,
         default_risk_tier: str = "low",
         audit_sink: Optional[AuditSink] = None,
         approval_handler: Optional[ApprovalHandler] = None,
+        server_id: str = "mcp",
+        tool_pins: Optional[MCPToolPins] = None,
+        mode: GuardMode = "enforce",
     ) -> None:
         self._session = session
         self._principal = principal
         # Left as None, not defaulted to AllowAllTools() here — the
-        # per-call ToolGuard built in call_tool already applies that
-        # exact default itself; resolving it twice would just be two
-        # copies of the same one-line fallback.
+        # per-call ToolGuard applies that default itself.
         self._policy = policy
         self._risk_tiers = dict(risk_tiers) if risk_tiers else {}
         self._default_risk_tier = default_risk_tier
-        # Same "None -> the library's own default type" resolution every
-        # other guard already does (ToolGuard/ModelGuard/RetrievalGuard) —
-        # resolved once here, then handed unchanged to every per-call
-        # ToolGuard built in call_tool, so all of them (and this session)
-        # share one audit_sink/approval_handler instance.
         self._audit_sink = audit_sink if audit_sink is not None else InMemoryAuditSink()
         self._approval_handler = (
             approval_handler if approval_handler is not None else CLIApprovalHandler()
         )
+        self._server_id = server_id
+        self._tool_pins = tool_pins
+        self._mode = mode
+        # tool name -> PinCheck from the most recent listing, and
+        # annotations for context. Only meaningful when tool_pins is set.
+        self._checks: dict[str, PinCheck] = {}
+        self._annotations: dict[str, dict[str, Any]] = {}
 
     @property
     def audit_log(self) -> AuditSink:
@@ -204,67 +403,123 @@ class GovernedMCPSession:
     def principal(self) -> Principal:
         return self._principal
 
+    @property
+    def server_id(self) -> str:
+        return self._server_id
+
     def __getattr__(self, item: str) -> Any:
-        # Transparent passthrough for every ClientSession method except
-        # call_tool (governed explicitly below) — see the class docstring.
-        # Only reached when normal attribute lookup on this object misses.
+        # Transparent passthrough for every client method except the two
+        # governed below. Only reached when normal lookup misses.
         return getattr(self._session, item)
 
+    def _audit_definition(self, tool_name: str, check: PinCheck, action: str) -> None:
+        self._audit_sink.write(
+            MCPToolDefinitionEntry(
+                timestamp=time.time(),
+                principal_id=self._principal.id,
+                server_id=self._server_id,
+                tool_name=tool_name,
+                status=check.status,
+                action=action,
+                expected_fingerprint=check.expected[:16] if check.expected else None,
+                actual_fingerprint=check.actual[:16],
+                shadowed_server=check.shadowed_server,
+                shadow=self._mode == "shadow",
+                on_behalf_of=self._principal.delegation_chain,
+            )
+        )
+
     async def list_tools(self, *args: Any, **kwargs: Any) -> "ListToolsResult":
-        """Ungoverned passthrough to `ClientSession.list_tools` — spelled
-        out explicitly (rather than left to `__getattr__`) only so it
-        shows up in this class's own public surface next to `call_tool`;
-        behavior is identical to letting `__getattr__` forward it."""
-        return await self._session.list_tools(*args, **kwargs)
+        """Forward to the client's `list_tools`. With `tool_pins`, check
+        every returned definition against its pin and drop any that fail
+        (enforce mode), auditing each newly pinned or refused tool."""
+        result = await self._session.list_tools(*args, **kwargs)
+        tools = list(getattr(result, "tools", None) or [])
+        for tool in tools:
+            name = _tool_field(tool, "name")
+            self._annotations[name] = _annotations_dict(tool)
+        if self._tool_pins is None:
+            return result
+
+        kept = []
+        for tool in tools:
+            name = _tool_field(tool, "name")
+            check = self._tool_pins.check(self._server_id, tool)
+            self._checks[name] = check
+            if check.status == "pinned_new":
+                self._audit_definition(name, check, "pinned")
+            elif check.blocked:
+                self._audit_definition(name, check, "audited_only" if self._mode == "shadow" else "hidden")
+            if not check.blocked or self._mode == "shadow":
+                kept.append(tool)
+        if len(kept) == len(tools):
+            return result
+        if hasattr(result, "model_copy"):
+            return result.model_copy(update={"tools": kept})
+        result.tools = kept
+        return result
+
+    async def _list_all_tools(self) -> None:
+        cursor: Optional[str] = None
+        seen: set[Optional[str]] = set()
+        while True:
+            result = await self.list_tools(cursor=cursor) if cursor else await self.list_tools()
+            cursor = getattr(result, "next_cursor", None)
+            if not cursor or cursor in seen:
+                return
+            seen.add(cursor)
 
     async def call_tool(
         self,
         name: str,
         arguments: Optional[dict[str, Any]] = None,
-        read_timeout_seconds: "timedelta | None" = None,
-        progress_callback: "ProgressFnT | None" = None,
-        *,
-        meta: Optional[dict[str, Any]] = None,
+        *args: Any,
         risk_tier: Optional[str] = None,
         context: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> "CallToolResult":
         """Evaluate policy, redact for the audit trail, get approval if
         required, log the outcome, and — only if allowed — forward the
         real `tools/call` request to the connected MCP server.
 
-        `name`, `arguments`, `read_timeout_seconds`, `progress_callback`,
-        and `meta` mirror `ClientSession.call_tool`'s own signature
-        exactly (verified against the installed SDK), so a caller
-        migrating from a raw `ClientSession` to a `GovernedMCPSession`
-        doesn't need to change how it calls `call_tool` at all — only
-        `risk_tier` and `context` are new, both keyword-only so they
-        can't collide with a positional call written against the real
-        SDK's signature. `risk_tier` overrides this call's entry in the
-        `risk_tiers` map passed at construction (and `default_risk_tier`)
-        for this one call. `context` reaches jurisdiction-aware policies
-        exactly the way `ToolGuard.call(..., context=...)`'s does.
+        Everything after `arguments` (timeouts, progress callbacks,
+        `meta`, `input_responses`, ...) is forwarded verbatim to the
+        wrapped client's own `call_tool`, so swapping a raw client for a
+        `GovernedMCPSession` needs no call-site changes. Only `risk_tier`
+        and `context` are new, both keyword-only.
 
-        Raises `ToolCallDenied` if the policy denies outright, or a
-        required approval is declined — the real server is never reached
-        in either case. See the module docstring for why this raises
-        instead of returning an `isError=True` CallToolResult.
+        Raises `ToolCallDenied` if the policy denies outright, a required
+        approval is declined, or (with `tool_pins`) the tool's definition
+        failed its pin check. With `tool_pins`, a tool not yet seen in this
+        session is listed first, so a tool can't be called around the
+        check by never listing it.
         """
-        arguments = dict(arguments) if arguments else {}
+        # Snapshot once: the dict evaluated and approved is the one sent.
+        arguments = _snapshot(arguments) if arguments else {}
         tier = risk_tier if risk_tier is not None else self._risk_tiers.get(name, self._default_risk_tier)
 
+        blocked_reason: Optional[str] = None
+        if self._tool_pins is not None:
+            if name not in self._checks:
+                await self._list_all_tools()
+            check = self._checks.get(name)
+            if check is None:
+                blocked_reason = "tool is not offered by this MCP server's tool listing"
+            elif check.blocked:
+                blocked_reason = _blocked_reason(check)
+
+        call_context = {
+            **(context or {}),
+            "mcp_server": self._server_id,
+            "mcp_annotations": self._annotations.get(name, {}),
+        }
         guard = ToolGuard(
-            tool=lambda **kw: self._session.call_tool(
-                name, kw, read_timeout_seconds, progress_callback, meta=meta
-            ),
-            policy=self._policy,
+            policy=_DefinitionGate(self._policy, blocked_reason),
             audit_sink=self._audit_sink,
             approval_handler=self._approval_handler,
             tool_name=name,
+            mode=self._mode,
+            mcp_server=self._server_id,
         )
-        # Synchronous all the way through (evaluate/redact/approve/audit);
-        # on allow/approved this *constructs* (doesn't run) the real
-        # call_tool coroutine via the lambda above — see the class
-        # docstring. On deny/declined, ToolGuard.call raises ToolCallDenied
-        # before the lambda is ever invoked, so no coroutine exists to await.
-        pending_call = guard.call(self._principal, arguments, risk_tier=tier, context=context)
-        return await pending_call
+        guard.authorize(self._principal, arguments, risk_tier=tier, context=call_context)
+        return await self._session.call_tool(name, arguments, *args, **kwargs)

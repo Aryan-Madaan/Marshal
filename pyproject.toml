@@ -1,53 +1,97 @@
 [project]
 name = "marshal-ai"
-version = "0.12.0"
-description = "Governance for AI systems: permission-aware retrieval (with real Chroma/LangChain vector-store adapters) backed by an observe-first shadow mode, tool-call approval with rate limiting/jurisdictional risk tiering (including MCP tool-call governance), model routing/budgets/data-residency/reliability, a durable, tamper-evident audit trail with EU AI Act-shaped compliance reports, and policy-as-config (YAML/JSON) for Marshal's existing composable policies — one library, one place to see what happened."
+version = "0.13.0"
+description = "Governance for AI agents: permission-aware retrieval with delegation (agent acting for a user), tool-call approval and lethal-trifecta flow control across retrieval and tools, egress allowlisting, MCP tool-call governance with tool-definition pinning, model routing/budgets/data-residency/reliability with provider-hosted-tool control, native hooks for LangChain, the Claude Agent SDK, Google ADK, the OpenAI Agents SDK and LiteLLM, and a durable, tamper-evident audit trail with EU AI Act-shaped compliance and Article 73 incident reports — one library, one place to see what happened."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Aryan Madaan" }]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Security",
     "Topic :: Software Development :: Libraries",
 ]
+# The core library has no runtime dependencies at all; everything below is
+# an optional extra. Floors are the versions this release was tested
+# against, and are at or above every known security fix for the paths
+# Marshal uses (see SECURITY.md).
 dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/Aryan-Madaan/marshal"
 Issues = "https://github.com/Aryan-Madaan/marshal/issues"
+Security = "https://github.com/Aryan-Madaan/marshal/security/policy"
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "opentelemetry-api>=1.20",
-    "opentelemetry-sdk>=1.20",
-    "openai>=1.0",
-    "anthropic>=0.30",
-    "google-genai>=1.0",
-    "chromadb>=0.4",
-    "langchain-core>=0.3",
-    "mcp>=1.0",
-    "pyyaml>=6",
+config = ["pyyaml>=6.0.2"]
+opentelemetry = ["opentelemetry-api>=1.45", "opentelemetry-sdk>=1.45"]
+openai = ["openai>=3.57"]
+anthropic = ["anthropic>=2.12"]
+# Tested on both 2.34 and 3.6; the floor stays on 2.x because google-adk
+# (the [adk] extra) still requires google-genai<3.
+google-genai = ["google-genai>=2.34"]
+# mcp 2.0-2.2 clients resend headers across cross-origin redirects
+# (CVE-2026-116685) and fetch server-chosen $ref URLs (CVE-2026-116686).
+mcp = ["mcp>=2.3"]
+# chromadb's open 2026 advisories are all in its HTTP server, which
+# Marshal's adapter never runs; see SECURITY.md. chromadb needs
+# onnxruntime, which has no wheels yet for CPython 3.15 anywhere, or for
+# Intel macOS on 3.14+ — the extra is empty there rather than unsolvable.
+chroma = [
+    "chromadb>=1.5.9; python_version < '3.15' and (sys_platform != 'darwin' or platform_machine != 'x86_64' or python_version < '3.14')",
 ]
-chroma = ["chromadb>=0.4"]
-langchain = ["langchain-core>=0.3"]
-mcp = ["mcp>=1.0"]
-opentelemetry = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
-openai = ["openai>=1.0"]
-anthropic = ["anthropic>=0.30"]
-google-genai = ["google-genai>=1.0"]
-config = ["pyyaml>=6"]
+langchain = ["langchain>=1.5", "langchain-core>=1.8"]
+claude-agent-sdk = ["claude-agent-sdk>=0.2.187"]
+adk = ["google-adk>=2.15"]
+openai-agents = ["openai-agents>=0.25"]
+# 1.82.7 and 1.82.8 were malicious uploads (MAL-2026-2144), excluded even
+# though the floor is above them, so a downgrade can never reach them.
+litellm = ["litellm>=1.110,!=1.82.7,!=1.82.8"]
+all = [
+    "marshal-ai[config,opentelemetry,openai,anthropic,google-genai,mcp,chroma,langchain,claude-agent-sdk,adk,openai-agents,litellm]",
+]
+dev = [
+    "marshal-ai[all]",
+    "pytest>=9.2",
+    # langchain-core's InMemoryVectorStore (used by the adapter tests)
+    # needs numpy; chromadb usually brings it in, but not on 3.15.
+    "numpy>=2.3",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+# Deprecations are errors, so an API Marshal uses can't be scheduled for
+# removal unnoticed. One exception: langsmith (imported by langchain-core)
+# still calls asyncio.iscoroutinefunction, deprecated on Python 3.14+ —
+# third-party code Marshal can't fix. Its auto-registered pytest plugin is
+# disabled for the same reason.
+addopts = "-p no:langsmith_plugin"
+filterwarnings = [
+    "error::DeprecationWarning",
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:langsmith",
+]
+
+[tool.uv]
+# Resolve the lockfile so every supported desktop/CI platform gets a
+# version with real wheels (onnxruntime dropped Intel macOS wheels).
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/marshal_ai"]

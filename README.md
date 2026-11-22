@@ -129,15 +129,49 @@ YAML or JSON file — a thin translation layer, not a new rules language,
 so it can't express anything the policy classes themselves can't. See
 below.
 
-See [`ideas.md`](./ideas.md) for what's next: a litellm proxy hook for
-deployments already running the LiteLLM proxy, and adapters for
-Pinecone/pgvector/Weaviate.
+New in v0.13, for agents specifically:
+
+- **Lethal-trifecta flow control** (`marshal_ai.flow`). Most real agent
+  data leaks combine private data, untrusted content and an outbound
+  channel in one session; no single call looks wrong. Marshal tracks that
+  combination across retrieval *and* tool calls, and escalates the one
+  call that would complete it. It's deterministic: no classifier for an
+  attacker to talk past.
+- **Egress allowlisting** (`marshal_ai.egress`). Tool arguments may only
+  point at allowed hosts, and exfiltration links (markdown images) can be
+  stripped from model output.
+- **MCP tool-definition pinning** (`MCPToolPins`), built on mcp 2. A server
+  that rewrites a tool's description after you approved it (a "rug pull"),
+  or a second server shadowing a tool name, is hidden from the model and
+  refused.
+- **Delegation** (`Principal(..., on_behalf_of=...)`). Every audit entry
+  records both the agent and the user it acts for. `DelegatedPolicy`
+  ensures the agent never sees more than that user may.
+- **Native framework hooks** for LangChain v1, the Claude Agent SDK,
+  Google ADK, the OpenAI Agents SDK, and the LiteLLM proxy, including its
+  MCP gateway.
+- **Full SDK coverage.** Every model-call entry point is governed:
+  `parse()`, `stream()`, the OpenAI Responses API, and Anthropic's beta
+  messages. Provider-hosted tools are refused at the request.
+- **Article 73 incident reports** (`marshal_ai.incidents`), and hardening
+  of Marshal's own code and supply chain. See [`SECURITY.md`](./SECURITY.md).
+
+See [`ideas.md`](./ideas.md) for what's next.
 
 ## Install
 
 ```bash
-pip install -e .
+pip install -e .                    # the core: no dependencies at all
+pip install -e ".[mcp,openai]"      # plus whichever integrations you use
 ```
+
+Requires Python 3.12 to 3.15. Each integration is an optional extra:
+`config`, `opentelemetry`, `openai`, `anthropic`, `google-genai`, `mcp`,
+`chroma`, `langchain`, `claude-agent-sdk`, `adk`, `openai-agents`,
+`litellm`, or `all`. The `chroma` extra is empty on Python 3.15 (and on
+Intel macOS with 3.14+), because chromadb's onnxruntime dependency has no
+wheels there yet. Contributors: `uv sync --locked --extra dev` installs
+the exact, hash-locked set CI tests against.
 
 (Not yet published to PyPI — clone and install locally for now.)
 
@@ -242,7 +276,7 @@ most agent frameworks speak. Its Enterprise-Managed Authorization spec
 governs whether a client may *connect* to a server — it explicitly does
 not govern individual tool actions at runtime, per call, per argument.
 `GovernedMCPSession` is that missing per-action check, wrapping a real
-`mcp.ClientSession` so every `call_tool()` goes through the same
+mcp 2 `Client` (or its `ClientSession`) so every `call_tool()` goes through the same
 `ToolGuard`/`ToolPolicy` machinery above *before* the request reaches the
 real MCP server — one governed session covers an agent's tool use across
 every framework that talks to that server over MCP, no per-framework
@@ -250,27 +284,42 @@ adapter needed.
 
 ```python
 import asyncio
+from mcp import Client
 from marshal_ai import Principal, RiskTierPolicy
-from marshal_ai.mcp import GovernedMCPSession
+from marshal_ai.mcp import GovernedMCPSession, MCPToolPins
+
+pins = MCPToolPins(path="mcp-pins.json")  # commit it; review changes like code
 
 async def main():
-    # `session` is a real, already-connected mcp.ClientSession.
-    governed = GovernedMCPSession(
-        session=session,
-        principal=Principal(id="agent-1"),
-        policy=RiskTierPolicy({"low": "allow", "high": "deny"}),
-        risk_tiers={"delete_database": "high", "read_file": "low"},
-    )
-    result = await governed.call_tool("read_file", {"path": "README.md"})
-    # a call to "delete_database" raises ToolCallDenied instead —
-    # the real server never sees that request; audited either way.
+    async with Client("https://mcp.internal.example/mcp") as client:
+        governed = GovernedMCPSession(
+            session=client,
+            principal=Principal(id="agent-1"),
+            policy=RiskTierPolicy({"low": "allow", "high": "deny"}),
+            risk_tiers={"delete_database": "high", "read_file": "low"},
+            server_id="internal-tools",
+            tool_pins=pins,
+        )
+        tools = await governed.list_tools()  # changed/shadowing tools are left out
+        result = await governed.call_tool("read_file", {"path": "README.md"})
+        # "delete_database" raises ToolCallDenied — the server never sees it.
 
 asyncio.run(main())
 ```
 
-Run `python examples/mcp_governance_example.py` for a fuller walkthrough
-(allow, require-approval, deny, and a hardcoded-credential block, all
-against a real in-process MCP server). Needs `pip install "marshal-ai[mcp]"`.
+Every argument after `arguments` is forwarded to the SDK verbatim, so
+swapping a raw client for a governed one needs no call-site changes.
+`MCPToolPins` hashes everything the model reads about each tool (name,
+description, schemas, annotations). If a server changes a definition after
+it was pinned, or a second server offers a tool name another server already
+provides, that tool is hidden from `list_tools()` and refused by
+`call_tool()` until someone reviews it and calls `pins.approve(...)`. The
+default is trust on first use; `MCPToolPins(on_new="deny")` admits only
+pre-approved tools.
+
+Run `python examples/mcp_governance_example.py` for allow,
+require-approval, deny, a hardcoded-credential block and a rug pull, all
+against a real in-process MCP server. Needs `pip install "marshal-ai[mcp]"`.
 
 ## Quickstart: agent reliability (rate limits, runaway loops, jurisdiction)
 
@@ -518,8 +567,17 @@ Anthropic case, or `python examples/adk_gemini_example.py` specifically
 for Google ADK's default model path (both denial-path-only, so they run
 with no API key).
 
-Patches the OpenAI, Anthropic, and Google GenAI SDK client classes
-(sync + async) by exact method reference, resolved when `enable()` runs
+Patches every model-call entry point of the OpenAI, Anthropic and Google
+GenAI SDKs, sync and async: `create`, `parse` and `stream` for chat
+completions, the OpenAI Responses API, and Anthropic `messages` and
+`beta.messages`, plus Gemini's `generate_content` and
+`generate_content_stream`. That's 28 methods; `patched_methods()` lists
+them so you can assert coverage at startup. Two more options:
+`hosted_tools={"web_search"}` refuses any request that enables another
+provider-executed tool, since no client-side wrapper can see those run,
+and `egress_allowlist=` audits links in model output (see
+`examples/hosted_tools_example.py`). Patches are applied by exact method
+reference, resolved when `enable()` runs
 — not the framework's code, which is what makes this work underneath any
 framework built on any of the three without per-framework adapters. For
 ADK specifically: `LlmAgent` calls Gemini through `google-genai`'s
@@ -536,7 +594,101 @@ updating when that happens). This surface only covers *model*
 routing/budget, deliberately — tool-call execution happens inside each
 framework's own dispatch code at a different layer with no equivalent
 single choke point; use `ToolGuard` directly around your tool functions
-for that surface. See `ideas.md` for the reasoning.
+for that surface — or, for the frameworks below, use their native hooks.
+
+## Quickstart: native framework hooks
+
+One `ToolGovernor` (policy, risk tiers, approvals, audit sink) enforced
+through each framework's own official extension point:
+
+```python
+from marshal_ai import Principal, RiskTierPolicy
+from marshal_ai.integrations import ToolGovernor
+
+governor = ToolGovernor(
+    policy=RiskTierPolicy({"low": "allow", "medium": "require_approval", "high": "deny"}),
+    principal=Principal("support-agent", on_behalf_of=Principal("alice")),
+    risk_tiers={"lookup_order": "low", "issue_refund": "medium", "delete_account": "high"},
+)
+
+# LangChain v1 / LangGraph
+from marshal_ai.integrations.langchain import MarshalToolMiddleware
+agent = create_agent(model, tools, middleware=[MarshalToolMiddleware(governor)])
+
+# Claude Agent SDK (built-in and MCP tools alike)
+from marshal_ai.integrations.claude_agent_sdk import marshal_hooks
+options = ClaudeAgentOptions(hooks=marshal_hooks(governor))
+
+# Google ADK (every agent the runner executes)
+from marshal_ai.integrations.adk import MarshalPlugin
+runner = Runner(agent=root_agent, app_name="app", session_service=svc, plugins=[MarshalPlugin(governor)])
+
+# OpenAI Agents SDK
+from marshal_ai.integrations.openai_agents import govern_tools, marshal_tool_guardrail
+govern_tools(agent, marshal_tool_guardrail(governor))
+```
+
+A refused call never runs. Where the framework allows it, the model gets
+the reason back as the tool's result, so the agent can recover instead of
+crashing. Through the Claude Agent SDK, an allowed call returns no
+decision, so the SDK's own permission prompts still apply. For the
+LiteLLM proxy, `marshal_ai.integrations.litellm.MarshalGuardrail` governs
+model routing and the proxy's MCP gateway in one guardrail. Run
+`python examples/framework_hooks_example.py` (offline, including a real
+LangChain agent run).
+
+## Quickstart: stopping prompt-injection exfiltration
+
+```python
+from marshal_ai import (
+    AttributePolicy, EgressAllowlist, EgressPolicy, FlowLabelingPolicy,
+    FlowTracker, LethalTrifectaPolicy, RetrievalGuard, RiskTierPolicy,
+)
+from marshal_ai.flow import EXTERNAL_COMMUNICATION, PRIVATE_DATA, UNTRUSTED_CONTENT
+
+tracker = FlowTracker(audit_sink=sink)
+retrieval = RetrievalGuard(
+    retriever,
+    # internal docs are private; documents tagged flow_labels=["untrusted_content"]
+    # (tickets, web pages, emails) are untrusted
+    policy=FlowLabelingPolicy(AttributePolicy(), tracker, default_labels={PRIVATE_DATA}),
+    audit_sink=sink,
+)
+tool_policy = EgressPolicy(
+    LethalTrifectaPolicy(
+        RiskTierPolicy({"low": "allow"}),
+        tracker,
+        tool_capabilities={"send_email": {EXTERNAL_COMMUNICATION}, "fetch_url": {UNTRUSTED_CONTENT}},
+    ),
+    EgressAllowlist(["*.ourcompany.example"]),
+    audit_sink=sink,
+)
+```
+
+A session that has read private data and untrusted content can't also
+send something out without approval. That's the "lethal trifecta" (or
+Meta's "Rule of Two") behind most real agent data leaks. Any session
+needs the destination host to be on the allowlist. Sessions are keyed by
+principal id, so give each agent session its own id. Run
+`python examples/prompt_injection_defense_example.py` for an injected
+support ticket being stopped.
+
+## Quickstart: an agent acting for a user
+
+```python
+from marshal_ai import AttributePolicy, DelegatedPolicy, Principal, RetrievalGuard
+
+bot = Principal("support-bot", {"role:support"})
+alice = Principal("alice", {"role:customer"})
+
+guard = RetrievalGuard(retriever, policy=DelegatedPolicy(AttributePolicy()), audit_sink=sink)
+guard.retrieve("refund policy", bot.acting_for(alice))  # only what *alice* may see
+sink.query(on_behalf_of="alice")                        # everything any agent did for her
+```
+
+Every audit entry on every surface records the delegation chain
+(`on_behalf_of`) next to the acting `principal_id`. Run
+`python examples/delegation_example.py`.
 
 ## Quickstart: sensitive-data detection
 
@@ -602,6 +754,28 @@ would-have-happened decisions in a clearly separate section — a shadow
 real allowed/denied/approval-required or cross-border transfer figures
 these reports exist to get right. Run `python
 examples/compliance_report_example.py` for a full end-to-end walkthrough.
+
+## Quickstart: serious-incident reports (EU AI Act Article 73)
+
+```python
+from marshal_ai import incident_candidates, record_incident, render_incident_markdown, serious_incident_report
+
+incident_candidates(sink)          # triage signals: blocked exfiltration, trifecta hits, changed MCP tools...
+incident = record_incident(sink, Principal("dpo@company"), title="...", category="fundamental_rights",
+                           description="...", role="deployer", affected_principals=("agent-7",))
+print(render_incident_markdown(serious_incident_report(sink, incident.incident_id)))
+```
+
+Marshal never declares an incident on its own; that's a legal judgment.
+It surfaces signals, records the human declaration (and the awareness
+time that starts the clock) in the tamper-evident trail, and computes the
+Article 73 deadlines: 15 days, 10 for a death, 2 for critical
+infrastructure or widespread infringement, and 24 hours for a deployer's
+notice to the provider. The report includes the related activity (counts,
+never content) and chain verification. Publish `sink.anchor()` somewhere
+the database's writer can't rewrite, and `sink.verify(anchor=...)` also
+catches deleted recent records, which a hash chain alone can't. Run
+`python examples/incident_report_example.py`. Not legal advice.
 
 ## Quickstart: policy as config
 
@@ -858,41 +1032,44 @@ otel_sink = OpenTelemetryAuditSink()
 RetrievalGuard(retriever=my_retriever, audit_sink=otel_sink)
 ```
 
-Model-call spans use the official OpenTelemetry GenAI semantic conventions
-(`gen_ai.request.model`, `gen_ai.usage.input_tokens`/`output_tokens`) where
-they're stable enough to rely on; tool-call and retrieval spans use a
-`marshal.*` namespace, since the GenAI semconv's tool/agent conventions are
-still in Development status as of 2026 — see `marshal_ai/otel.py`'s
-docstring for the reasoning. `OpenTelemetryAuditSink` is write-only
+Spans follow the OpenTelemetry GenAI and MCP semantic conventions wherever
+one exists. Tool calls are `execute_tool {tool}` spans with
+`gen_ai.operation.name` and `gen_ai.tool.name`, plus `mcp.method.name`
+when the call went through MCP. Model spans use `gen_ai.request.model` and
+`gen_ai.usage.*`. Delegated calls carry `user.id` (the subject) and
+`gen_ai.agent.id` (the actor). Marshal's own `marshal.*` attributes are
+kept alongside, since those conventions are still in Development status.
+See `marshal_ai/otel.py`'s docstring. `OpenTelemetryAuditSink` is write-only
 (`all_entries`/`tail`/`query` raise `NotImplementedError` — spans live in
 your tracing backend, not in this process).
 
 ## Status
 
-v0.12 — all three governance surfaces (retrieval; tool calls with rate
-limiting, runaway-loop detection, and jurisdiction-aware risk tiering;
-model routing/budgets/cross-border data residency/data retention/
-reliability-aware circuit breaking), one shared audit trail, OpenTelemetry
-export, a local CLI viewer, one-line model governance for any
-OpenAI/Anthropic/Google-GenAI-based framework via SDK patching (with
-automatic outcome/latency reporting) — including Google ADK's default
-Gemini path specifically, verified against ADK's own source rather than
-assumed — and deterministic sensitive-data detection across every
-surface. New this release: policy-as-config (`load_policies` builds
-Marshal's existing policies from a reviewable YAML/JSON file, fail-closed
-on any malformed input). New in v0.11: an observe-first `mode="shadow"` on every
-guard; real Chroma and LangChain adapters for `RetrievalGuard` (Chroma
-integration is shipped, no longer in progress); MCP tool-call governance
-(`marshal_ai.mcp.GovernedMCPSession`) — the shared choke point every
-MCP-speaking framework now has, reframing the old "tool-call interception
-needs a framework-specific adapter" problem; and durable, tamper-evident
-`SQLiteAuditSink` plus `marshal_ai.reports`' EU AI Act Article 12/26-shaped
-compliance reports, both shadow-mode-aware so a would-have-denied decision
-is never counted as a real one. See [`ideas.md`](./ideas.md) for what's
-next (time-to-first-token tracking for streaming calls; an N-failed-calls
-trigger for `RunawayAgentPolicy` once `ToolGuard` reports call outcomes
-the way `ModelGuard` does; a litellm proxy hook for deployments already
-running the LiteLLM proxy; adapters for Pinecone/pgvector/Weaviate).
+v0.13. Governs all three surfaces (retrieval; tool calls; model calls)
+with one shared, tamper-evident audit trail. Tool-call governance covers
+risk tiers, rate limits, runaway loops, jurisdiction, and MCP. Model
+governance covers routing, budgets, data residency, retention and circuit
+breaking. Also included: shadow mode, policy-as-config, sensitive-data
+detection, OpenTelemetry export, and EU AI Act-shaped activity,
+cross-border and Article 73 incident reports.
+
+New this release:
+- cross-surface lethal-trifecta flow control and egress allowlisting;
+- MCP 2 support with tool-definition pinning;
+- delegation (agent acting for a user);
+- native hooks for LangChain, the Claude Agent SDK, ADK, the OpenAI Agents
+  SDK and the LiteLLM proxy;
+- governance of every SDK model-call entry point, plus refusal of
+  provider-hosted tools;
+- Python 3.12 to 3.15;
+- a security pass over Marshal itself: a fixed ReDoS, Unicode-evasion
+  handling, fail-closed edges, approval TOCTOU, audit-chain anchoring, and
+  a hardened CI and release pipeline.
+
+See [`SECURITY.md`](./SECURITY.md) for the threat model and its stated
+limits, and [`ideas.md`](./ideas.md) for what's next. That includes
+A2A governance, more framework hooks, flow labels from tool results,
+time-to-first-token tracking, and adapters for Pinecone/pgvector/Weaviate.
 
 ## License
 

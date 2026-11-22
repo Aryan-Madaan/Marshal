@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -332,3 +333,44 @@ def test_creates_parent_directories(tmp_path: Path):
     sink.write(make_retrieval_entry(1))
     assert path.exists()
     sink.close()
+
+
+def test_anchor_detects_deletion_of_the_newest_records(tmp_path):
+    import sqlite3
+
+    from marshal_ai import ChainAnchor
+
+    path = tmp_path / "audit.db"
+    sink = SQLiteAuditSink(path)
+    for i in range(5):
+        sink.write(AuditEntry(time.time(), f"p{i}", "q", 1, [], [], {}))
+    anchor = sink.anchor()
+    assert isinstance(anchor, ChainAnchor) and anchor.count == 5
+    assert sink.verify(anchor=anchor).ok
+    sink.close()
+
+    conn = sqlite3.connect(path)
+    conn.execute("DELETE FROM audit_entries WHERE seq = (SELECT MAX(seq) FROM audit_entries)")
+    conn.commit()
+    conn.close()
+
+    reopened = SQLiteAuditSink(path)
+    assert reopened.verify().ok  # the chain alone can't see a truncated tail
+    result = reopened.verify(anchor=anchor)
+    assert not result.ok and "deleted" in result.reason
+
+
+def test_anchor_detects_a_rewritten_chain(tmp_path):
+    a, b = SQLiteAuditSink(tmp_path / "a.db"), SQLiteAuditSink(tmp_path / "b.db")
+    for sink, who in ((a, "real"), (b, "forged")):
+        sink.write(AuditEntry(time.time(), who, "q", 1, [], [], {}))
+    result = b.verify(anchor=a.anchor())
+    assert not result.ok and "rewritten" in result.reason
+
+
+def test_anchor_on_an_empty_sink_and_growth_after_anchoring(tmp_path):
+    sink = SQLiteAuditSink(tmp_path / "a.db")
+    empty = sink.anchor()
+    assert empty.count == 0 and sink.verify(anchor=empty).ok
+    sink.write(AuditEntry(time.time(), "p", "q", 1, [], [], {}))
+    assert sink.verify(anchor=empty).ok  # appending after an anchor is fine

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
@@ -57,8 +58,20 @@ def _detector(name: str, pattern: str, flags: int = 0) -> Detector:
     return Detector(name=name, pattern=re.compile(pattern, flags))
 
 
+# Every pattern below must stay linear-time on adversarial input — this
+# code runs over attacker-controlled text (prompts, tool arguments,
+# retrieved documents) on the request path, so a catastrophically
+# backtracking pattern is a denial-of-service. Possessive quantifiers
+# (`++`, `{2,}+`, Python 3.11+) and start-boundary lookbehinds keep each
+# match attempt from re-scanning text it already rejected;
+# tests/test_sensitive.py times every detector on adversarial input.
 DEFAULT_DETECTORS: list[Detector] = [
-    _detector("EMAIL", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+    # The lookbehind stops a match from starting mid-run, which is what
+    # made the pre-v0.13 pattern quadratic on long text with no "@".
+    _detector(
+        "EMAIL",
+        r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]++@(?:[A-Za-z0-9-]++\.)++[A-Za-z]{2,}+",
+    ),
     _detector("PHONE_US", r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
     _detector("SSN_US", r"\b\d{3}-\d{2}-\d{4}\b"),
     _detector(
@@ -73,6 +86,11 @@ DEFAULT_DETECTORS: list[Detector] = [
     ),
     _detector("JWT", r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
     _detector("PRIVATE_KEY_BLOCK", r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+    # Unicode "tag" characters (U+E0000–U+E007F) render as nothing at all
+    # but are read by models — "ASCII smuggling" hides prompt-injection
+    # instructions in them. Their only legitimate use is a handful of
+    # subdivision flag emoji, so a run of them is worth blocking.
+    _detector("UNICODE_TAG_SMUGGLING", "[\U000E0000-\U000E007F]{2,}+"),
 ]
 
 # Detectors severe enough that finding one is grounds to refuse the call
@@ -81,8 +99,22 @@ DEFAULT_DETECTORS: list[Detector] = [
 # blocking a document because it contains an email address would make the
 # feature useless day one. Widen per deployment via `block_detectors=`.
 DEFAULT_BLOCK_DETECTORS: frozenset[str] = frozenset(
-    {"PRIVATE_KEY_BLOCK", "AWS_ACCESS_KEY_ID", "GENERIC_API_KEY"}
+    {"PRIVATE_KEY_BLOCK", "AWS_ACCESS_KEY_ID", "GENERIC_API_KEY", "UNICODE_TAG_SMUGGLING"}
 )
+
+# Invisible characters that can be spliced into a secret to break a regex
+# match without changing how the text looks or how most systems parse it:
+# zero-width space/joiners, word joiner, BOM, soft hyphen, bidi controls.
+# Unicode tag characters are deliberately *not* stripped — they're
+# detected on the raw text by UNICODE_TAG_SMUGGLING above.
+_INVISIBLE = re.compile("[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]")
+
+
+def canonicalize(text: str) -> str:
+    """The form detectors also run against: invisible characters removed,
+    then NFKC-normalized (fullwidth digits/letters become ASCII). Used for
+    detection only — never shown to anyone in place of the original."""
+    return unicodedata.normalize("NFKC", _INVISIBLE.sub("", text))
 
 
 @dataclass(frozen=True)
@@ -99,25 +131,55 @@ class SensitiveDataScanner:
     def __init__(self, detectors: Optional[Iterable[Detector]] = None) -> None:
         self._detectors = list(detectors) if detectors is not None else list(DEFAULT_DETECTORS)
 
-    def scan(self, text: str) -> list[Finding]:
-        if not text:
-            return []
-        findings = []
+    def _scan_one(self, text: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
         for detector in self._detectors:
             matches = detector.pattern.findall(text)
             if matches:
-                findings.append(Finding(detector.name, len(matches)))
-        return findings
+                counts[detector.name] = len(matches)
+        return counts
 
-    def redact(self, text: str) -> tuple[str, list[Finding]]:
+    def scan(self, text: str) -> list[Finding]:
+        """Run every detector over both the raw text and its
+        `canonicalize()`d form, so a secret split by zero-width characters
+        or written in fullwidth digits is still found. Each detector
+        reports the higher of its two counts."""
         if not text:
-            return text, []
-        findings = []
+            return []
+        counts = self._scan_one(text)
+        canonical = canonicalize(text)
+        if canonical != text:
+            for name, count in self._scan_one(canonical).items():
+                counts[name] = max(count, counts.get(name, 0))
+        order = [d.name for d in self._detectors]
+        return [Finding(name, counts[name]) for name in order if name in counts]
+
+    def _redact_one(self, text: str) -> tuple[str, dict[str, int]]:
+        counts: dict[str, int] = {}
         for detector in self._detectors:
             text, count = detector.pattern.subn(f"[REDACTED:{detector.name}]", text)
             if count:
-                findings.append(Finding(detector.name, count))
-        return text, findings
+                counts[detector.name] = count
+        return text, counts
+
+    def redact(self, text: str) -> tuple[str, list[Finding]]:
+        """Replace every match. When the canonical form reveals matches
+        the raw text hides, the canonical form is what gets redacted and
+        returned — the invisible characters are dropped rather than
+        letting an obfuscated secret through unredacted."""
+        if not text:
+            return text, []
+        redacted, counts = self._redact_one(text)
+        canonical = canonicalize(text)
+        if canonical != text:
+            canonical_redacted, canonical_counts = self._redact_one(canonical)
+            if any(canonical_counts.get(name, 0) > counts.get(name, 0) for name in canonical_counts):
+                redacted, counts = canonical_redacted, {
+                    name: max(canonical_counts.get(name, 0), counts.get(name, 0))
+                    for name in set(counts) | set(canonical_counts)
+                }
+        order = [d.name for d in self._detectors]
+        return redacted, [Finding(name, counts[name]) for name in order if name in counts]
 
 
 @dataclass(frozen=True)
@@ -135,6 +197,7 @@ class SensitiveDataEntry:
     location: str  # document id / argument name / resolved model name
     findings: list[str] = field(default_factory=list)
     action: str = "audited_only"  # "redacted" | "blocked" | "audited_only"
+    on_behalf_of: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "sensitive_data", **asdict(self)}
@@ -160,6 +223,7 @@ def write_finding(
         SensitiveDataEntry(
             timestamp=time.time(),
             principal_id=principal.id,
+            on_behalf_of=principal.delegation_chain,
             surface=surface,
             location=location,
             findings=[f"{f.detector}:{f.count}" for f in findings],

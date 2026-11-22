@@ -21,17 +21,66 @@ GuardMode = Literal["enforce", "shadow"]
 
 @dataclass(frozen=True)
 class Principal:
-    """Whoever is making the retrieval call. `attributes` is a flat set of
-    strings — roles, departments, clearance levels, whatever your policy
-    matches against (e.g. {"role:hr", "dept:finance"})."""
+    """Whoever is making the call. `attributes` is a flat set of strings —
+    roles, departments, clearance levels, whatever your policy matches
+    against (e.g. {"role:hr", "dept:finance"}).
+
+    `on_behalf_of` — the principal this one is acting for, when an agent
+    acts for a user: `Principal("support-bot", on_behalf_of=Principal("alice"))`.
+    `id` is always the *actor* (who is actually making the call); the
+    subject (whose authority it's exercising) is the far end of the
+    `on_behalf_of` chain. This is RFC 8693's actor/subject split, and
+    nests for multi-hop delegation (an agent calling a sub-agent for a
+    user). Every audit entry records the chain (`on_behalf_of` ids,
+    nearest first) next to `principal_id`, so "what was done for alice"
+    is answerable even when alice never called anything herself. Wrap a
+    retrieval policy in `DelegatedPolicy` to also *enforce* that the actor
+    can never see more than the subject it's acting for.
+    """
 
     id: str
     attributes: frozenset[str] = field(default_factory=frozenset)
+    on_behalf_of: Optional["Principal"] = None
 
     def __post_init__(self) -> None:
         # Accept a plain list/set/tuple and normalize it, since callers
         # shouldn't have to know frozenset is the internal representation.
         object.__setattr__(self, "attributes", frozenset(self.attributes))
+
+    @property
+    def delegation_chain(self) -> list[str]:
+        """Ids of every principal this one is acting on behalf of, nearest
+        first — `[]` when acting as itself."""
+        chain: list[str] = []
+        current = self.on_behalf_of
+        while current is not None:
+            chain.append(current.id)
+            current = current.on_behalf_of
+        return chain
+
+    @property
+    def subject(self) -> "Principal":
+        """Whose authority this call ultimately exercises — the far end of
+        the `on_behalf_of` chain, or this principal itself."""
+        current = self
+        while current.on_behalf_of is not None:
+            current = current.on_behalf_of
+        return current
+
+    def acting_for(self, subject: "Principal") -> "Principal":
+        """A copy of this principal acting on behalf of `subject`."""
+        return replace(self, on_behalf_of=subject)
+
+    def hops(self) -> list["Principal"]:
+        """This principal and every principal it acts for, actor first,
+        each with its own `on_behalf_of` cleared — what `DelegatedPolicy`
+        evaluates one at a time."""
+        result: list[Principal] = []
+        current: Optional[Principal] = self
+        while current is not None:
+            result.append(replace(current, on_behalf_of=None))
+            current = current.on_behalf_of
+        return result
 
 
 @dataclass(frozen=True)
@@ -163,6 +212,50 @@ class GroupPolicy(Policy):
             # absent" portably, so let RetrievalGuard fall back to post-filtering.
             return None
         return {self._group_field: {"$in": sorted(principal.attributes)}}
+
+
+class DelegatedPolicy(Policy):
+    """Wraps another `Policy` so a principal acting `on_behalf_of` someone
+    else only sees a document if *every* hop in the chain is allowed to —
+    the actor and each subject it's acting for. Closes the confused-deputy
+    gap: a support agent with broad access, acting for a customer, can't
+    retrieve a document that customer couldn't retrieve themselves (and a
+    user can't borrow an agent's broader access by routing a request
+    through it). A principal with no `on_behalf_of` is evaluated exactly
+    as the base policy would.
+
+    Redaction composes the same way: every hop's `redact()` is applied in
+    turn, so the result is hidden from whichever hop is most restricted.
+    Pushdown filtering is skipped (`to_filter` returns None) for a
+    delegated principal, since two per-hop filters can't be AND-ed
+    portably across stores — `RetrievalGuard` post-filters instead, which
+    is always correct.
+    """
+
+    def __init__(self, base: Policy) -> None:
+        self._base = base
+
+    def evaluate(self, principal: Principal, metadata: dict[str, Any]) -> PolicyDecision:
+        if principal.on_behalf_of is None:
+            return self._base.evaluate(principal, metadata)
+        hops = principal.hops()
+        for hop in hops:
+            decision = self._base.evaluate(hop, metadata)
+            if not decision.allowed:
+                return PolicyDecision(
+                    False, f"denied for {hop.id!r} in delegation chain: {decision.reason}"
+                )
+        return PolicyDecision(True, f"allowed for every hop in delegation chain {[h.id for h in hops]}")
+
+    def to_filter(self, principal: Principal) -> Optional[dict[str, Any]]:
+        if principal.on_behalf_of is not None:
+            return None
+        return self._base.to_filter(principal)
+
+    def redact(self, principal: Principal, document: "Document") -> "Document":
+        for hop in principal.hops():
+            document = self._base.redact(hop, document)
+        return document
 
 
 @dataclass(frozen=True)

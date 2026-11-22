@@ -15,12 +15,24 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 from marshal_ai.audit import AuditableEvent, JSONLAuditSink, is_denied
+
+
+# Audit entries carry attacker-influenced text (queries, tool names,
+# reasons echoing model output). Printed raw, an ESC sequence could
+# rewrite the terminal, forge earlier lines, or plant an OSC 8 hyperlink;
+# bidi and tag characters can make a line read differently than it is.
+_UNSAFE_FOR_TERMINAL = re.compile("[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\U000e0000-\U000e007f]")
+
+
+def _terminal_safe(text: str) -> str:
+    return _UNSAFE_FOR_TERMINAL.sub(lambda m: f"\\x{{{ord(m.group()):x}}}", text)
 
 
 def _summarize(entry: AuditableEvent) -> str:
@@ -43,6 +55,14 @@ def _summarize(entry: AuditableEvent) -> str:
         return f'model={data["model"]} prompt={data["prompt_tokens"]} completion={data["completion_tokens"]}'
     if kind == "sensitive_data":
         return f'[{data["surface"]}] {data["location"]}: {data["findings"]} -> {data["action"]}'
+    if kind == "egress":
+        return f'[{data["surface"]}] {data["location"]}: {data["hosts"]} -> {data["action"]}'
+    if kind == "flow_label":
+        return f'{data["source"]} added {data["labels_added"]} (now {data["labels_now"]})'
+    if kind == "mcp_tool_definition":
+        return f'{data["server_id"]}/{data["tool_name"]}: {data["status"]} -> {data["action"]}'
+    if kind == "incident":
+        return f'{data["incident_id"]} [{data["category"]}] {data["title"]}'
     return str(data)
 
 
@@ -51,7 +71,7 @@ def _format_row(entry: AuditableEvent) -> str:
     ts = datetime.fromtimestamp(entry.timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     kind = data.get("kind", "unknown")
     flag = "!" if is_denied(entry) else " "
-    return f"{flag} {ts}  {kind:<12} {entry.principal_id:<12} {_summarize(entry)}"
+    return _terminal_safe(f"{flag} {ts}  {kind:<12} {entry.principal_id:<12} {_summarize(entry)}")
 
 
 def _print_entries(entries: list[AuditableEvent]) -> None:

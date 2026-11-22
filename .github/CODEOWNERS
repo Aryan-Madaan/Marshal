@@ -1,0 +1,4 @@
+# Changes to CI/CD and dependency pins need the maintainer's review.
+/.github/ @Aryan-Madaan
+/pyproject.toml @Aryan-Madaan
+/uv.lock @Aryan-Madaan

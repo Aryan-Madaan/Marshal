@@ -507,6 +507,82 @@ piece of that story, not this one.
   `PolicyConfigError`" contract, and `version: true`/`version: 1.0`
   passed the version check because `True == 1` in Python. Both now raise
   `PolicyConfigError`, with regression tests.
+- **v0.13 — agent-security release: cross-surface flow control, egress,
+  MCP pinning, delegation, native framework hooks, full SDK coverage,
+  Article 73 incidents, and hardening of Marshal itself.** Driven by an
+  outside-world survey (agent security research, MCP/OTel/identity
+  standards, the framework ecosystem, regulation, and dependency CVEs)
+  rather than the backlog alone. What shipped, and why each piece:
+  - **`marshal_ai.flow` — the lethal-trifecta gate.** The real agent data
+    leaks of 2025-2026 (EchoLeak, the GitHub MCP "toxic flow", Supabase
+    MCP) all combined private data, untrusted content, and an outbound
+    channel in one session — no single call looked wrong. `FlowTracker`
+    accumulates per-session labels from retrieval (`FlowLabelingPolicy`)
+    and tool calls (`LethalTrifectaPolicy`), and escalates only the call
+    that completes the combination. Deterministic, not a classifier:
+    adaptive attacks broke 12 published classifier defenses ("The
+    Attacker Moves Second", USENIX Security 2026). Marshal is unusually
+    placed for this because it already governs both retrieval and tools.
+  - **`marshal_ai.egress` — destination allowlisting.** `EgressPolicy` for
+    tool arguments (nested, keys included), `sanitize()` for model output
+    (markdown-image exfiltration). Parses conservatively: userinfo,
+    backslashes and control characters count as disallowed, and hosts
+    compare after IDNA, since `urllib.parse` is not WHATWG (CVE-2024-11168,
+    CVE-2025-0938). Audits hosts only, never URLs — the query string is
+    where stolen data goes.
+  - **MCP 2 + tool-definition pinning.** `GovernedMCPSession` now wraps
+    mcp 2's `Client` or `ClientSession` (the 2026-07-28 protocol removed
+    the initialize handshake; nothing here depended on it) and forwards
+    every SDK argument verbatim. `MCPToolPins` hashes each tool's
+    model-visible definition: rug pulls and cross-server shadowing are
+    hidden from `list_tools()` and refused by `call_tool()` until
+    re-approved.
+  - **Delegation (`Principal.on_behalf_of`, `DelegatedPolicy`).** Actor
+    and subject recorded separately on every audit entry (RFC 8693's
+    split, what NIST's agent-identity work points at); `DelegatedPolicy`
+    requires every hop to be allowed, closing the confused deputy;
+    `query(on_behalf_of=...)` answers "what was done for alice".
+  - **Native framework hooks** (closes the "framework-specific tool-call
+    interception" backlog item): LangChain v1 middleware, Claude Agent
+    SDK `PreToolUse`, ADK plugin, OpenAI Agents tool guardrail, and a
+    LiteLLM proxy guardrail (closes the "litellm proxy hook" item) that
+    also governs the proxy's MCP gateway. All share one `ToolGovernor`
+    built on the new `ToolGuard.authorize()`.
+  - **Full SDK coverage.** The patch layer covered 6 entry points; it now
+    covers 28. `parse()`, `stream()`, the OpenAI Responses API and
+    Anthropic `beta.messages` had all gone around governance. Plus
+    `hosted_tools=` to refuse provider-executed tools at the request (no
+    client wrapper ever sees them run) and `patched_methods()` to assert
+    coverage at startup.
+  - **OTel semconv** for tool spans (`execute_tool`, `gen_ai.tool.name`,
+    `mcp.method.name`; `user.id`/`gen_ai.agent.id` for delegation),
+    `marshal.*` kept alongside.
+  - **`marshal_ai.incidents`** — Article 73 triage signals, a hash-chained
+    human declaration, deadlines (15/10/2 days; deployer notice 24h), and
+    a report with chain verification. Never declares an incident itself.
+  - **Hardening Marshal itself.** Found and fixed a shipped ReDoS: the
+    `EMAIL` detector took ~20 s on 100 KB of hostile text (now ~30 ms,
+    every detector timed in tests). Detection now also runs on
+    NFKC-normalized text with zero-width/bidi characters removed, and
+    `UNICODE_TAG_SMUGGLING` blocks ASCII smuggling. `ToolGuard` fails
+    closed on policy exceptions, unknown outcomes and broken approval
+    channels, and snapshots arguments so what's approved is what runs.
+    `SQLiteAuditSink.anchor()`/`verify(anchor=)` catch truncation. The
+    CLI escapes terminal control sequences. The config loader rejects
+    YAML aliases and oversized files.
+  - **Platform and supply chain.** Python 3.12-3.15; every extra floored
+    at the tested version and past known CVEs (`mcp>=2.3`; litellm's
+    malicious 1.82.7/1.82.8 excluded); hash-locked `uv.lock`; CI with
+    SHA-pinned actions, a read-only token, pip-audit and zizmor; Trusted
+    Publishing release workflow with attestations; Dependabot cooldown;
+    `SECURITY.md`. Also fixed: CI only triggered on `main`, but the
+    branch is `master`, so pushes never ran it.
+  **Found along the way**: the integration test fixture restored a
+  monkeypatched fake on teardown (fixture ordering), leaking it into later
+  tests; Claude Agent SDK MCP tools were evaluated under their full
+  `mcp__server__tool` name, so tiers configured for the bare name never
+  applied; google-adk still requires google-genai<3, so the genai floor
+  stays on 2.x (tested on both).
 
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
@@ -537,25 +613,28 @@ keeping each surface's scope maximally narrow.
   cleanly to the others; add per-backend as adoption justifies rather
   than speculatively building all three now.
 
-- **Framework-specific tool-call interception for frameworks that don't
-  speak MCP.** v0.11's `GovernedMCPSession` (see Shipped above) closes
-  this for any framework built on MCP, which reframed the original
-  problem: MCP is now the shared choke point tool calls never had before.
-  What's left is narrower than the original item — a framework whose tool
-  dispatch never goes through MCP at all (a hand-rolled loop calling
-  Python functions directly, or a framework's own non-MCP tool-calling
-  convention) still has no equivalent SDK-patch choke point the way model
-  calls do; wrapping tool functions in `ToolGuard` directly remains the
-  real (explicit, not automatic) answer there, same as before this
-  release.
+- **Framework hooks: the remaining gaps.** v0.13 ships native hooks for
+  LangChain, the Claude Agent SDK, ADK, the OpenAI Agents SDK and the
+  LiteLLM proxy. Not covered yet: CrewAI, Pydantic AI v2 capabilities,
+  Microsoft Agent Framework middleware, Mastra (TypeScript, out of scope
+  for a Python library). Also, the Claude Agent SDK hook could map
+  `require_approval` to the SDK's own `permissionDecision: "ask"` (the
+  user's own prompt) instead of Marshal's approval handler — needs a way
+  to audit "deferred to the host" honestly rather than as "approved".
 
-- **A litellm proxy hook**, for teams already running the LiteLLM proxy rather
-  than calling `openai`/`anthropic` directly — `async_pre_call_hook` on a
-  `CustomLogger` subclass, registered via `litellm_settings.callbacks`. Skipped
-  for now in favor of direct SDK patching (see "Shipped" above) since it only
-  reaches proxy deployments, and has documented 2026 bugs around certain
-  endpoints/tool calls bypassing it entirely — worth re-checking litellm's
-  docs before picking this up, this area moves.
+- **A2A (Agent2Agent) governance.** A2A v1.0 is a second inter-agent call
+  path next to MCP (signed Agent Cards, new operation names). Same shape
+  as `GovernedMCPSession`: wrap the client, govern `SendMessage`.
+
+- **Flow labels from more sources.** `LethalTrifectaPolicy` takes labels
+  from retrieval metadata and declared tool capabilities. MCP resources
+  (`read_resource`) and tool *results* (a fetched web page is untrusted
+  content even if the tool was called safely) could label the session
+  too — the second needs a post-call hook on each surface.
+
+- **Chroma on Python 3.15.** chromadb's onnxruntime dependency has no
+  CPython 3.15 wheels (or Intel-macOS 3.14 wheels) yet, so the `[chroma]`
+  extra is empty there. Drop the marker once onnxruntime ships them.
 
 - **Estimate-before-call budget checks.** `BudgetPolicy` today only enforces on
   the *next* call once prior usage has been reported — it can't yet block a call

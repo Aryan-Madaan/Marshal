@@ -34,12 +34,25 @@ class OpenTelemetryAuditSink(AuditSink):
     also want local queryability — Marshal doesn't provide a fan-out sink
     itself; it's a five-line `AuditSink` subclass if you need one.
 
-    Attribute naming: model-call spans use the official OpenTelemetry
-    GenAI semantic conventions (`gen_ai.*`) where they're stable enough to
-    rely on. Tool-call and retrieval spans use a `marshal.*` namespace
-    instead — the GenAI semconv's tool/agent span conventions are still in
-    Development status as of 2026 (see `ideas.md`), so this doesn't
-    pretend there's a stable official convention that doesn't exist yet.
+    Attribute naming follows the OpenTelemetry GenAI semantic conventions
+    (verified against `opentelemetry-semantic-conventions` 0.66b2) wherever
+    one exists, with Marshal's own `marshal.*` attributes alongside:
+
+    - Tool calls are `execute_tool {tool}` spans carrying
+      `gen_ai.operation.name="execute_tool"` and `gen_ai.tool.name`; calls
+      made through `GovernedMCPSession` add `mcp.method.name="tools/call"`
+      (the MCP semconv names tools with `gen_ai.tool.name`, not an
+      `mcp.*` attribute).
+    - Model routing/usage spans use `gen_ai.request.model` and
+      `gen_ai.usage.*`.
+    - Delegation: when the actor acts `on_behalf_of` someone, `user.id` is
+      the subject and `gen_ai.agent.id` the acting principal.
+
+    The GenAI and MCP conventions are still in Development status, so the
+    `marshal.*` attributes (the pre-v0.13 names) are kept, unchanged, for
+    anything already built on them. Retrieval, flow-label, egress and
+    MCP tool-definition spans have no semconv equivalent and stay
+    `marshal.{kind}`.
     """
 
     def __init__(self, tracer: Optional[trace.Tracer] = None) -> None:
@@ -48,8 +61,17 @@ class OpenTelemetryAuditSink(AuditSink):
     def write(self, entry: AuditableEvent) -> None:
         data = entry.to_dict()
         kind = data.get("kind", "unknown")
-        with self._tracer.start_as_current_span(f"marshal.{kind}") as span:
+        if kind == "tool_call":
+            span_name = f"execute_tool {data.get('tool_name', '')}".strip()
+        else:
+            span_name = f"marshal.{kind}"
+        with self._tracer.start_as_current_span(span_name) as span:
             span.set_attribute("marshal.principal_id", entry.principal_id)
+            chain = data.get("on_behalf_of") or []
+            if chain:
+                span.set_attribute("marshal.on_behalf_of", list(chain))
+                span.set_attribute("user.id", chain[-1])
+                span.set_attribute("gen_ai.agent.id", entry.principal_id)
             handler = self._HANDLERS.get(kind)
             if handler is not None:
                 handler(self, span, data)
@@ -58,7 +80,7 @@ class OpenTelemetryAuditSink(AuditSink):
                 # user registered) — still export something rather than
                 # silently dropping it.
                 for key, value in data.items():
-                    if key not in ("kind", "principal_id") and _is_span_attr_safe(value):
+                    if key not in ("kind", "principal_id", "on_behalf_of") and _is_span_attr_safe(value):
                         span.set_attribute(f"marshal.{key}", value)
 
     def _write_retrieval(self, span: trace.Span, data: dict[str, Any]) -> None:
@@ -70,6 +92,13 @@ class OpenTelemetryAuditSink(AuditSink):
             span.set_status(Status(StatusCode.ERROR, "one or more documents denied"))
 
     def _write_tool_call(self, span: trace.Span, data: dict[str, Any]) -> None:
+        span.set_attribute("gen_ai.operation.name", "execute_tool")
+        span.set_attribute("gen_ai.tool.name", data["tool_name"])
+        if data.get("mcp_server"):
+            span.set_attribute("mcp.method.name", "tools/call")
+            span.set_attribute("marshal.mcp.server", data["mcp_server"])
+        if data.get("shadow"):
+            span.set_attribute("marshal.shadow", True)
         span.set_attribute("marshal.tool.name", data["tool_name"])
         span.set_attribute("marshal.tool.risk_tier", data["risk_tier"])
         span.set_attribute("marshal.tool.outcome", data["outcome"])
@@ -101,12 +130,30 @@ class OpenTelemetryAuditSink(AuditSink):
         if data["action"] == "blocked":
             span.set_status(Status(StatusCode.ERROR, "sensitive data detected"))
 
+    def _write_egress(self, span: trace.Span, data: dict[str, Any]) -> None:
+        span.set_attribute("marshal.egress.surface", data["surface"])
+        span.set_attribute("marshal.egress.location", data["location"])
+        span.set_attribute("marshal.egress.hosts", data["hosts"])
+        span.set_attribute("marshal.egress.action", data["action"])
+        if data["action"] == "blocked":
+            span.set_status(Status(StatusCode.ERROR, "egress to non-allowlisted host"))
+
+    def _write_mcp_tool_definition(self, span: trace.Span, data: dict[str, Any]) -> None:
+        span.set_attribute("gen_ai.tool.name", data["tool_name"])
+        span.set_attribute("marshal.mcp.server", data["server_id"])
+        span.set_attribute("marshal.mcp.pin_status", data["status"])
+        span.set_attribute("marshal.mcp.action", data["action"])
+        if data["action"] == "hidden":
+            span.set_status(Status(StatusCode.ERROR, f"MCP tool definition {data['status']}"))
+
     _HANDLERS = {
         "retrieval": _write_retrieval,
         "tool_call": _write_tool_call,
         "model_call": _write_model_call,
         "model_usage": _write_model_usage,
         "sensitive_data": _write_sensitive_data,
+        "egress": _write_egress,
+        "mcp_tool_definition": _write_mcp_tool_definition,
     }
 
 

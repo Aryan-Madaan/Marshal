@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from marshal_ai.audit import AuditableEvent, AuditSink, decode_entry, is_denied
+from marshal_ai.audit import AuditableEvent, AuditSink, acted_for, decode_entry, is_denied
 
 # `decode_entry` (audit.py) turns a decoded JSON dict back into the right
 # dataclass via the `kind` discriminator + `register_entry_type` registry
@@ -119,6 +119,20 @@ class ChainVerificationResult:
     broken_kind: Optional[str] = None
     broken_principal_id: Optional[str] = None
     reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ChainAnchor:
+    """A point-in-time commitment to the chain: how many records it held
+    and the hash of the newest one. A hash chain alone can't detect the
+    newest records being deleted (what's left is still a valid, shorter
+    chain) or the whole file being rolled back to an older copy. Store an
+    anchor somewhere the database's own writer can't rewrite — a
+    write-once bucket, a ticket, a signed message, a second system's log
+    — and pass it to `verify(anchor=...)` later."""
+
+    count: int
+    head_hash: str
 
 
 class SQLiteAuditSink(AuditSink):
@@ -225,6 +239,7 @@ class SQLiteAuditSink(AuditSink):
         since: Optional[float] = None,
         until: Optional[float] = None,
         denied_only: bool = False,
+        on_behalf_of: Optional[str] = None,
     ) -> list[AuditableEvent]:
         """Same filter semantics as `AuditSink.query` (inclusive
         `since`/`until`), overridden here to push `principal_id`/
@@ -255,11 +270,21 @@ class SQLiteAuditSink(AuditSink):
                 params,
             ).fetchall()
         entries = [decode_entry(json.loads(row[0])) for row in rows]
+        if on_behalf_of is not None:
+            entries = [e for e in entries if acted_for(e, on_behalf_of)]
         if denied_only:
             entries = [e for e in entries if is_denied(e)]
         return entries
 
-    def verify(self) -> ChainVerificationResult:
+    def anchor(self) -> ChainAnchor:
+        """The current `ChainAnchor` — publish it externally on a schedule."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), (SELECT hash FROM audit_entries ORDER BY seq DESC LIMIT 1) FROM audit_entries"
+            ).fetchone()
+        return ChainAnchor(count=row[0], head_hash=row[1] or GENESIS_HASH)
+
+    def verify(self, anchor: Optional[ChainAnchor] = None) -> ChainVerificationResult:
         """Walk the stored chain in insertion order and identify the
         first record where the recorded chain and a freshly recomputed
         chain diverge.
@@ -280,6 +305,13 @@ class SQLiteAuditSink(AuditSink):
         that wants to state chain integrity as a fact in a compliance
         document) can inspect `ok` without wrapping every call in
         `try/except`.
+
+        With `anchor` (from an earlier `anchor()` call, kept outside this
+        database), also checks that the chain still contains at least
+        `anchor.count` records and that record number `anchor.count`
+        still has `anchor.head_hash` — catching deletion of the newest
+        records and rollback to an older copy, which the chain alone
+        cannot.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -318,6 +350,28 @@ class SQLiteAuditSink(AuditSink):
                     ),
                 )
             expected_prev = stored_hash
+
+        if anchor is not None:
+            if len(rows) < anchor.count:
+                return ChainVerificationResult(
+                    ok=False,
+                    checked=len(rows),
+                    reason=(
+                        f"chain holds {len(rows)} records but the anchor commits to {anchor.count} "
+                        "— the newest records were deleted, or the file was rolled back"
+                    ),
+                )
+            anchored_hash = rows[anchor.count - 1][5] if anchor.count else GENESIS_HASH
+            if anchored_hash != anchor.head_hash:
+                seq, kind, principal_id = rows[anchor.count - 1][:3] if anchor.count else (None, None, None)
+                return ChainVerificationResult(
+                    ok=False,
+                    checked=len(rows),
+                    broken_at_seq=seq,
+                    broken_kind=kind,
+                    broken_principal_id=principal_id,
+                    reason="record at the anchored position has a different hash — the chain was rewritten",
+                )
 
         return ChainVerificationResult(ok=True, checked=len(rows))
 

@@ -590,6 +590,7 @@ class ModelCallEntry:
     outcome: str  # "allow" | "deny"
     reason: str
     shadow: bool = False
+    on_behalf_of: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "model_call", **asdict(self)}
@@ -609,6 +610,7 @@ class ModelUsageEntry:
     model: str
     prompt_tokens: int
     completion_tokens: int
+    on_behalf_of: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "model_usage", **asdict(self)}
@@ -635,6 +637,7 @@ class ModelOutcomeEntry:
     success: bool
     latency_ms: Optional[float] = None
     error: Optional[str] = None
+    on_behalf_of: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "model_outcome", **asdict(self)}
@@ -715,6 +718,7 @@ class ModelGuard:
             ModelCallEntry(
                 timestamp=time.time(),
                 principal_id=principal.id,
+                on_behalf_of=principal.delegation_chain,
                 logical_name=logical_name,
                 resolved_model=resolved_model,
                 outcome=decision.outcome,
@@ -747,6 +751,7 @@ class ModelGuard:
             ModelUsageEntry(
                 timestamp=time.time(),
                 principal_id=principal.id,
+                on_behalf_of=principal.delegation_chain,
                 model=model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
@@ -772,6 +777,7 @@ class ModelGuard:
             ModelOutcomeEntry(
                 timestamp=time.time(),
                 principal_id=principal.id,
+                on_behalf_of=principal.delegation_chain,
                 model=model,
                 success=success,
                 latency_ms=latency_ms,

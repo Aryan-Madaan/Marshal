@@ -115,3 +115,19 @@ def test_parser_requires_a_subcommand():
     assert args.path == "somefile.jsonl"
     assert args.n == 20
     assert args.follow is False
+
+
+def test_untrusted_text_cannot_inject_terminal_escapes(tmp_path, capsys):
+    from marshal_ai import JSONLAuditSink, Principal, ToolGuard
+    from marshal_ai.cli import main
+
+    path = tmp_path / "audit.jsonl"
+    sink = JSONLAuditSink(path)
+    hostile = "lookup\x1b[2J\x1b]8;;https://evil.example\x07click\x1b]8;;\x07\nFORGED ROW‮"
+    ToolGuard(tool=lambda **kw: 1, audit_sink=sink, tool_name=hostile).call(Principal(id="a"), {})
+
+    main(["tail", str(path)])
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out and "‮" not in out
+    assert out.count("\n") == 1  # the embedded newline did not forge a second row
+    assert "\\x{1b}" in out

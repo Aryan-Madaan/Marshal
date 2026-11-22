@@ -529,3 +529,56 @@ def test_sensitive_data_from_config_still_redacts_without_a_config_supplied_sink
     # has no audit_sink wired in, exactly as documented.
     kinds = {entry.to_dict()["kind"] for entry in sink.all_entries()}
     assert kinds == {"retrieval"}
+
+
+def test_yaml_alias_bomb_is_rejected(tmp_path):
+    bomb = "a: &a [x, x, x, x, x, x, x, x, x]\n" + "".join(
+        f"{chr(98 + i)}: &{chr(98 + i)} [*{chr(97 + i)}, *{chr(97 + i)}, *{chr(97 + i)}, *{chr(97 + i)}]\n"
+        for i in range(8)
+    )
+    path = tmp_path / "policies.yaml"
+    path.write_text(bomb, encoding="utf-8")
+    with pytest.raises(PolicyConfigError, match="aliases are not allowed"):
+        load_policies(path)
+
+
+def test_oversized_config_file_is_refused_before_parsing(tmp_path):
+    from marshal_ai.config import MAX_CONFIG_BYTES
+
+    path = tmp_path / "policies.json"
+    path.write_text(" " * (MAX_CONFIG_BYTES + 1) + "{}", encoding="utf-8")
+    with pytest.raises(PolicyConfigError, match="limit"):
+        load_policies(path)
+
+
+def test_pathologically_nested_json_raises_policy_config_error(tmp_path):
+    path = tmp_path / "policies.json"
+    path.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    with pytest.raises(PolicyConfigError):
+        load_policies(path)
+
+
+def test_yaml_python_object_tags_are_still_refused(tmp_path):
+    path = tmp_path / "policies.yaml"
+    path.write_text("tool_policy: !!python/object/apply:os.system ['echo pwned']\n", encoding="utf-8")
+    with pytest.raises(PolicyConfigError, match="invalid YAML"):
+        load_policies(path)
+
+
+def test_delegated_and_egress_policies_load_from_config():
+    from marshal_ai import DelegatedPolicy, EgressPolicy
+
+    loaded = load_policies({
+        "retrieval_policy": {"base": {"type": "attribute"}, "wrappers": [{"type": "delegated"}]},
+        "tool_policy": {
+            "base": {"type": "allow_all"},
+            "wrappers": [{"type": "egress", "allowed_hosts": ["api.github.com", "*.example.com"]}],
+        },
+    })
+    assert isinstance(loaded.retrieval_policy, DelegatedPolicy)
+    assert isinstance(loaded.tool_policy, EgressPolicy)
+    with pytest.raises(PolicyConfigError, match="on_violation"):
+        load_policies({"tool_policy": {"base": {"type": "allow_all"}, "wrappers": [
+            {"type": "egress", "allowed_hosts": [], "on_violation": "allow"}]}})
+    with pytest.raises(PolicyConfigError, match="allowed_hosts"):
+        load_policies({"tool_policy": {"base": {"type": "allow_all"}, "wrappers": [{"type": "egress"}]}})

@@ -79,6 +79,11 @@ class AuditEntry:
     Both fields default to their enforce-mode-equivalent values (`False`,
     `{}`) so older JSONL/SQLite logs written before shadow mode existed —
     and simply lack these two keys — still decode correctly.
+
+    `on_behalf_of` — ids of whoever `principal_id` was acting for, nearest
+    first (`Principal.delegation_chain`); `[]` when acting as itself.
+    Every entry type carries this field, defaulting to `[]` so logs
+    written before v0.13 still decode.
     """
 
     timestamp: float
@@ -90,6 +95,7 @@ class AuditEntry:
     denied_reasons: dict[str, str]
     shadow: bool = False
     would_redact_fields: dict[str, list[str]] = field(default_factory=dict)
+    on_behalf_of: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "retrieval", **asdict(self)}
@@ -113,6 +119,12 @@ def is_denied(entry: AuditableEvent) -> bool:
         or getattr(entry, "outcome", None) in ("deny", "declined")
         or getattr(entry, "action", None) == "blocked"
     )
+
+
+def acted_for(entry: AuditableEvent, subject_id: str) -> bool:
+    """True if `entry` was written for `subject_id` via delegation —
+    duck-typed on the `on_behalf_of` field every built-in entry carries."""
+    return subject_id in (getattr(entry, "on_behalf_of", None) or [])
 
 
 class AuditSink(ABC):
@@ -143,15 +155,20 @@ class AuditSink(ABC):
         since: Optional[float] = None,
         until: Optional[float] = None,
         denied_only: bool = False,
+        on_behalf_of: Optional[str] = None,
     ) -> list[AuditableEvent]:
         """Filter the audit trail — e.g. "everything Bob was denied last
         week," across *every* surface writing to this sink, not just
         retrieval. `since`/`until` are Unix timestamps (see `time.time()`),
-        inclusive on both ends.
+        inclusive on both ends. `on_behalf_of` keeps entries where that id
+        appears anywhere in the delegation chain — "everything any agent
+        did for alice."
         """
         entries = self.all_entries()
         if principal_id is not None:
             entries = [e for e in entries if e.principal_id == principal_id]
+        if on_behalf_of is not None:
+            entries = [e for e in entries if acted_for(e, on_behalf_of)]
         if since is not None:
             entries = [e for e in entries if e.timestamp >= since]
         if until is not None:

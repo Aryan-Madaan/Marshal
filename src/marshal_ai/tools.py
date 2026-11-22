@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -398,6 +399,15 @@ class AutoApprove(ApprovalHandler):
         return self._approve
 
 
+def _snapshot(arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return copy.deepcopy(arguments)
+    except Exception:
+        # Un-copyable values (open handles, locks) — copy the top level,
+        # which still stops keys from being added or swapped.
+        return dict(arguments)
+
+
 def _redacted_argument_names(raw: dict[str, Any], redacted: dict[str, Any]) -> list[str]:
     """Which argument keys `ToolPolicy.redact_arguments()` actually
     changed relative to the real, raw arguments — names only, never the
@@ -431,6 +441,10 @@ class ToolCallEntry:
     names only, never values, so a reader can see *what* a redaction
     rule targets without the audit trail itself becoming a second copy
     of what it's meant to hide.
+
+    `on_behalf_of` — the delegation chain (see `Principal.on_behalf_of`).
+    `mcp_server` — set when the call went through `GovernedMCPSession`,
+    naming which MCP server it was sent to.
     """
 
     timestamp: float
@@ -443,6 +457,8 @@ class ToolCallEntry:
     approved_by: Optional[str] = None
     shadow: bool = False
     would_redact_fields: list[str] = field(default_factory=list)
+    on_behalf_of: list[str] = field(default_factory=list)
+    mcp_server: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "tool_call", **asdict(self)}
@@ -467,17 +483,25 @@ class ToolGuard:
     audit entry, but never raises and never requests approval — the
     wrapped tool is always called with the real arguments, letting a team
     see what governance *would* have blocked before turning enforcement on.
+
+    `tool` may be omitted when something else executes the tool — a
+    framework's own dispatcher, an MCP server — and Marshal only needs to
+    decide whether it may run: call `authorize()` instead of `call()`.
+    `tool_name` is then required.
     """
 
     def __init__(
         self,
-        tool: Tool,
+        tool: Optional[Tool] = None,
         policy: Optional[ToolPolicy] = None,
         audit_sink: Optional[AuditSink] = None,
         approval_handler: Optional[ApprovalHandler] = None,
         tool_name: Optional[str] = None,
         mode: GuardMode = "enforce",
+        mcp_server: Optional[str] = None,
     ) -> None:
+        if tool is None and tool_name is None:
+            raise ValueError("tool_name is required when no tool callable is given")
         self._tool = tool
         self._policy = policy if policy is not None else AllowAllTools()
         self._audit_sink = audit_sink if audit_sink is not None else InMemoryAuditSink()
@@ -486,10 +510,15 @@ class ToolGuard:
         )
         self._tool_name = tool_name or getattr(tool, "__name__", "tool")
         self._mode = mode
+        self._mcp_server = mcp_server
 
     @property
     def audit_log(self) -> AuditSink:
         return self._audit_sink
+
+    @property
+    def tool_name(self) -> str:
+        return self._tool_name
 
     def _audit(
         self,
@@ -513,8 +542,102 @@ class ToolGuard:
                 approved_by=approved_by,
                 shadow=shadow,
                 would_redact_fields=would_redact_fields or [],
+                on_behalf_of=request.principal.delegation_chain,
+                mcp_server=self._mcp_server,
             )
         )
+
+    def authorize(
+        self,
+        principal: Principal,
+        arguments: dict[str, Any],
+        risk_tier: str = "low",
+        context: Optional[dict[str, Any]] = None,
+    ) -> ToolDecision:
+        """Everything `call()` does *except* invoking the tool: evaluate
+        policy, redact for the audit trail, get approval if required, and
+        log the outcome. Returns the policy's decision when the call may
+        proceed; raises `ToolCallDenied` when it may not.
+
+        In shadow mode this never raises and never requests approval —
+        it returns the real decision (possibly "deny") for the caller to
+        record, and the caller should proceed regardless.
+        """
+        request = ToolCallRequest(
+            tool_name=self._tool_name,
+            arguments=arguments,
+            principal=principal,
+            risk_tier=risk_tier,
+            context=context or {},
+        )
+        # Fail closed: a policy that raises is a denial, never an
+        # accidental allow. Audited with the exception type only — never
+        # its message, which could echo argument values.
+        try:
+            decision = self._policy.evaluate(request)
+            redacted = self._policy.redact_arguments(request)
+        except Exception as exc:
+            decision = ToolDecision("deny", f"policy error ({type(exc).__name__}) — failing closed")
+            redacted = {key: "[UNAVAILABLE: policy error]" for key in arguments}
+        would_redact_fields = _redacted_argument_names(request.arguments, redacted)
+
+        if self._mode == "shadow":
+            # decision.outcome is audited verbatim ("allow"/"deny"/
+            # "require_approval") — the real policy's raw answer, not
+            # translated into "approved"/"declined" the way enforce mode
+            # does, since no approval flow ever runs here.
+            self._audit(
+                request,
+                redacted,
+                decision.outcome,
+                decision.reason,
+                approved_by=None,
+                shadow=True,
+                would_redact_fields=would_redact_fields,
+            )
+            return decision
+
+        if decision.outcome == "deny":
+            self._audit(
+                request, redacted, "deny", decision.reason, approved_by=None,
+                would_redact_fields=would_redact_fields,
+            )
+            raise ToolCallDenied(request.tool_name, decision.reason)
+
+        if decision.outcome == "require_approval":
+            try:
+                approved = self._approval_handler.request_approval(request, redacted)
+            except Exception:
+                # An approval channel that errors (timeout, Slack down)
+                # is a decline, never an approval.
+                approved = False
+            if approved is not True:
+                self._audit(
+                    request, redacted, "declined", decision.reason, approved_by=None,
+                    would_redact_fields=would_redact_fields,
+                )
+                raise ToolCallDenied(request.tool_name, "approval declined")
+            self._audit(
+                request, redacted, "approved", decision.reason,
+                approved_by=self._approval_handler.identity,
+                would_redact_fields=would_redact_fields,
+            )
+        elif decision.outcome == "allow":
+            self._audit(
+                request, redacted, "allow", decision.reason, approved_by=None,
+                would_redact_fields=would_redact_fields,
+            )
+        else:
+            # An outcome outside the vocabulary (a buggy custom policy
+            # returning "allowed" or "") must not fall through to the
+            # allow path.
+            reason = f"unknown policy outcome {decision.outcome!r} — failing closed"
+            self._audit(
+                request, redacted, "deny", reason, approved_by=None,
+                would_redact_fields=would_redact_fields,
+            )
+            raise ToolCallDenied(request.tool_name, reason)
+        return decision
 
     def call(
         self,
@@ -533,58 +656,11 @@ class ToolGuard:
         still computed and audited but never enforced: this never raises,
         never requests approval, and always calls the wrapped tool.
         """
-        request = ToolCallRequest(
-            tool_name=self._tool_name,
-            arguments=arguments,
-            principal=principal,
-            risk_tier=risk_tier,
-            context=context or {},
-        )
-        decision = self._policy.evaluate(request)
-        redacted = self._policy.redact_arguments(request)
-        would_redact_fields = _redacted_argument_names(request.arguments, redacted)
-
-        if self._mode == "shadow":
-            # decision.outcome is audited verbatim ("allow"/"deny"/
-            # "require_approval") — the real policy's raw answer, not
-            # translated into "approved"/"declined" the way enforce mode
-            # does, since no approval flow ever runs here.
-            self._audit(
-                request,
-                redacted,
-                decision.outcome,
-                decision.reason,
-                approved_by=None,
-                shadow=True,
-                would_redact_fields=would_redact_fields,
-            )
-            return self._tool(**arguments)
-
-        if decision.outcome == "deny":
-            self._audit(
-                request, redacted, "deny", decision.reason, approved_by=None,
-                would_redact_fields=would_redact_fields,
-            )
-            raise ToolCallDenied(request.tool_name, decision.reason)
-
-        approved_by: Optional[str] = None
-        if decision.outcome == "require_approval":
-            approved = self._approval_handler.request_approval(request, redacted)
-            if not approved:
-                self._audit(
-                    request, redacted, "declined", decision.reason, approved_by=None,
-                    would_redact_fields=would_redact_fields,
-                )
-                raise ToolCallDenied(request.tool_name, "approval declined")
-            approved_by = self._approval_handler.identity
-            self._audit(
-                request, redacted, "approved", decision.reason, approved_by=approved_by,
-                would_redact_fields=would_redact_fields,
-            )
-        else:
-            self._audit(
-                request, redacted, "allow", decision.reason, approved_by=None,
-                would_redact_fields=would_redact_fields,
-            )
-
+        if self._tool is None:
+            raise TypeError("this ToolGuard has no tool callable; use authorize() instead")
+        # One frozen copy is evaluated, shown to the approver, audited and
+        # executed: nothing that mutates the caller's dict (or anything
+        # nested in it) while an approval is pending can change what runs.
+        arguments = _snapshot(arguments)
+        self.authorize(principal, arguments, risk_tier=risk_tier, context=context)
         return self._tool(**arguments)

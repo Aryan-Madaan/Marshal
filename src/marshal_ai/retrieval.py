@@ -137,6 +137,7 @@ class RetrievalGuard:
                 denied_reasons=denied_reasons,
                 shadow=shadow,
                 would_redact_fields=would_redact_fields,
+                on_behalf_of=principal.delegation_chain,
             )
         )
 

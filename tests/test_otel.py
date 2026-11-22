@@ -72,7 +72,7 @@ def test_tool_call_span_records_approval(otel_sink):
     guard.call(Principal(id="alice"), {}, risk_tier="medium")
 
     span = exporter.get_finished_spans()[0]
-    assert span.name == "marshal.tool_call"
+    assert span.name.startswith("execute_tool ")
     attrs = dict(span.attributes)
     assert attrs["marshal.tool.name"] == "delete_record"
     assert attrs["marshal.tool.outcome"] == "approved"
@@ -178,4 +178,22 @@ def test_unified_trail_across_all_three_guards_produces_three_spans(otel_sink):
     ModelGuard(policy=AllowAllModels(), audit_sink=sink).resolve(alice, "m")
 
     names = {s.name for s in exporter.get_finished_spans()}
-    assert names == {"marshal.retrieval", "marshal.tool_call", "marshal.model_call"}
+    assert {n.split(" ")[0] for n in names} == {"marshal.retrieval", "execute_tool", "marshal.model_call"}
+
+
+def test_tool_call_span_follows_genai_and_mcp_semconv_with_delegation(otel_sink):
+    sink, exporter = otel_sink
+    guard = ToolGuard(tool_name="lookup_order", audit_sink=sink, mcp_server="orders")
+    agent = Principal(id="support-bot", on_behalf_of=Principal(id="alice"))
+
+    guard.authorize(agent, {"order_id": "42"})
+
+    span = exporter.get_finished_spans()[0]
+    assert span.name == "execute_tool lookup_order"
+    attrs = dict(span.attributes)
+    assert attrs["gen_ai.operation.name"] == "execute_tool"
+    assert attrs["gen_ai.tool.name"] == "lookup_order"
+    assert attrs["mcp.method.name"] == "tools/call"
+    assert attrs["user.id"] == "alice"  # the subject
+    assert attrs["gen_ai.agent.id"] == "support-bot"  # the actor
+    assert attrs["marshal.tool.name"] == "lookup_order"  # pre-v0.13 name kept

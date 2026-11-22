@@ -4,6 +4,7 @@ from marshal_ai.retrieval import Document, RetrievalGuard
 from marshal_ai.policy import (
     AllowAll,
     AttributePolicy,
+    DelegatedPolicy,
     FieldRedaction,
     GroupPolicy,
     GuardMode,
@@ -57,8 +58,28 @@ from marshal_ai.sensitive import (
     SensitiveDataScanner,
     SensitiveDataToolPolicy,
 )
-from marshal_ai.mcp import GovernedMCPSession
-from marshal_ai.sinks import ChainVerificationResult, GENESIS_HASH, SQLiteAuditSink
+from marshal_ai.mcp import GovernedMCPSession, MCPToolDefinitionEntry, MCPToolPins, tool_fingerprint
+from marshal_ai.flow import (
+    EXTERNAL_COMMUNICATION,
+    LETHAL_TRIFECTA,
+    PRIVATE_DATA,
+    UNTRUSTED_CONTENT,
+    FlowLabelEntry,
+    FlowLabelingPolicy,
+    FlowTracker,
+    LethalTrifectaPolicy,
+)
+from marshal_ai.egress import EgressAllowlist, EgressEntry, EgressPolicy
+from marshal_ai.incidents import (
+    IncidentEntry,
+    IncidentReport,
+    IncidentSignal,
+    incident_candidates,
+    record_incident,
+    render_incident_markdown,
+    serious_incident_report,
+)
+from marshal_ai.sinks import ChainAnchor, ChainVerificationResult, GENESIS_HASH, SQLiteAuditSink
 from marshal_ai.reports import (
     ActivityRecord,
     CrossBorderDataFlowReport,
@@ -79,7 +100,7 @@ from marshal_ai.reports import (
 # used for `marshal_ai.otel` and `marshal_ai.integrations`: optional-
 # backend code stays out of the core namespace, reached one import away.
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 __all__ = [
     "AuditableEvent",
@@ -95,6 +116,7 @@ __all__ = [
     "RetrievalGuard",
     "AllowAll",
     "AttributePolicy",
+    "DelegatedPolicy",
     "FieldRedaction",
     "GroupPolicy",
     "GuardMode",
@@ -142,6 +164,28 @@ __all__ = [
     "SensitiveDataScanner",
     "SensitiveDataToolPolicy",
     "GovernedMCPSession",
+    "MCPToolDefinitionEntry",
+    "MCPToolPins",
+    "tool_fingerprint",
+    "EXTERNAL_COMMUNICATION",
+    "LETHAL_TRIFECTA",
+    "PRIVATE_DATA",
+    "UNTRUSTED_CONTENT",
+    "FlowLabelEntry",
+    "FlowLabelingPolicy",
+    "FlowTracker",
+    "LethalTrifectaPolicy",
+    "EgressAllowlist",
+    "EgressEntry",
+    "EgressPolicy",
+    "IncidentEntry",
+    "IncidentReport",
+    "IncidentSignal",
+    "incident_candidates",
+    "record_incident",
+    "render_incident_markdown",
+    "serious_incident_report",
+    "ChainAnchor",
     "ChainVerificationResult",
     "GENESIS_HASH",
     "SQLiteAuditSink",

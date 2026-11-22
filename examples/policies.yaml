@@ -16,6 +16,9 @@ retrieval_policy:
     # Regardless of who's allowed to see a document, redact anything that
     # looks like a secret/PII in its content.
     - type: sensitive_data
+    # An agent acting on behalf of a user sees only what that user may
+    # (and what the agent itself may) — no confused deputy.
+    - type: delegated
 
 tool_policy:
   base:
@@ -41,6 +44,10 @@ tool_policy:
       overrides_by_jurisdiction:
         EU:
           employment_decision: require_approval
+    # Any URL in a tool call's arguments must point at our own hosts —
+    # the exfiltration step of most prompt-injection attacks is a URL.
+    - type: egress
+      allowed_hosts: ["ourcompany.example", "*.ourcompany.example"]
 
 model_policy:
   base:

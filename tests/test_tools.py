@@ -413,3 +413,82 @@ def test_jurisdictional_override_rejects_invalid_outcome_at_construction():
     base = RiskTierPolicy({"x": "allow"})
     with pytest.raises(ValueError):
         JurisdictionalRiskTierPolicy(base, overrides_by_jurisdiction={"EU": {"x": "not-a-real-outcome"}})
+
+
+# --- v0.13 hardening ---------------------------------------------------------
+
+from marshal_ai import ToolDecision, ToolPolicy  # noqa: E402
+from marshal_ai.tools import ApprovalHandler  # noqa: E402
+
+
+class _Exploding(ToolPolicy):
+    def evaluate(self, request):
+        raise RuntimeError("bug in a custom policy containing secret=hunter2")
+
+
+class _BadOutcome(ToolPolicy):
+    def evaluate(self, request):
+        return ToolDecision("allowed", "typo in a custom policy")
+
+
+def test_policy_exception_fails_closed_and_never_logs_the_message():
+    sink = InMemoryAuditSink()
+    ran = []
+    guard = ToolGuard(tool=lambda **kw: ran.append(1), policy=_Exploding(), audit_sink=sink)
+    with pytest.raises(ToolCallDenied, match="failing closed"):
+        guard.call(Principal(id="a"), {"x": 1})
+    assert ran == []
+    assert "hunter2" not in str(sink.tail(1)[0].to_dict())
+
+
+def test_unknown_policy_outcome_fails_closed():
+    ran = []
+    guard = ToolGuard(tool=lambda **kw: ran.append(1), policy=_BadOutcome())
+    with pytest.raises(ToolCallDenied, match="unknown policy outcome"):
+        guard.call(Principal(id="a"), {})
+    assert ran == []
+
+
+def test_approval_handler_that_errors_or_returns_truthy_non_bool_is_a_decline():
+    class Broken(ApprovalHandler):
+        def request_approval(self, request, redacted_arguments):
+            raise TimeoutError("slack down")
+
+    class Truthy(ApprovalHandler):
+        def request_approval(self, request, redacted_arguments):
+            return "yes"  # truthy, but not an explicit True
+
+    policy = RiskTierPolicy({"medium": "require_approval"})
+    for handler in (Broken(), Truthy()):
+        guard = ToolGuard(tool=lambda **kw: "ran", policy=policy, approval_handler=handler)
+        with pytest.raises(ToolCallDenied, match="approval declined"):
+            guard.call(Principal(id="a"), {}, risk_tier="medium")
+
+
+def test_arguments_mutated_while_approval_is_pending_do_not_change_what_runs():
+    received = {}
+    args = {"to": "ops@example.com", "cc": ["team@example.com"]}
+
+    class MutatingApprover(ApprovalHandler):
+        def request_approval(self, request, redacted_arguments):
+            # Something else holding a reference swaps the target mid-approval.
+            args["to"] = "attacker@evil.example"
+            args["cc"].append("attacker@evil.example")
+            return True
+
+    guard = ToolGuard(
+        tool=lambda **kw: received.update(kw),
+        policy=RiskTierPolicy({"medium": "require_approval"}),
+        approval_handler=MutatingApprover(),
+    )
+    guard.call(Principal(id="a"), args, risk_tier="medium")
+    assert received == {"to": "ops@example.com", "cc": ["team@example.com"]}
+
+
+def test_authorize_without_a_tool_and_tool_name_required():
+    guard = ToolGuard(tool_name="external_tool")
+    assert guard.authorize(Principal(id="a"), {}).outcome == "allow"
+    with pytest.raises(TypeError):
+        guard.call(Principal(id="a"), {})
+    with pytest.raises(ValueError):
+        ToolGuard()

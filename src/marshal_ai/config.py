@@ -77,6 +77,9 @@ retrieval_policy (`marshal_ai.policy`, `marshal_ai.sensitive`):
     `{field, requires_attribute, replacement?}`).
   - `sensitive_data` (wrapper) -> `SensitiveDataPolicy`: no params (see
     "Left Python-only" below).
+  - `delegated` (wrapper) -> `DelegatedPolicy`: no params. Put it last,
+    so every hop of a delegation chain is checked against the full chain
+    of wrappers below it.
 
 tool_policy (`marshal_ai.tools`):
   - `risk_tier` (base) -> `RiskTierPolicy`: `tiers` (dict[str, str]),
@@ -93,6 +96,9 @@ tool_policy (`marshal_ai.tools`):
   - `sensitive_data` (wrapper) -> `SensitiveDataToolPolicy`:
     `block_detectors` (optional list of detector names — must be a subset
     of `marshal_ai.DEFAULT_DETECTORS`' names; omit for the built-in default).
+  - `egress` (wrapper) -> `EgressPolicy`: `allowed_hosts` (list of hosts or
+    `*.domain` patterns), `on_violation` ("deny" | "require_approval",
+    default "deny").
 
 model_policy (`marshal_ai.models`):
   - `allowlist` (base) -> `AllowlistModelPolicy`: `routes` (dict[str,
@@ -129,6 +135,9 @@ further exactly as you would if you'd constructed it yourself):
     hand with the same sink your guard uses.
   - `ApprovalHandler` (`CLIApprovalHandler`/`AutoApprove`/your own) — passed
     to `ToolGuard` directly, not part of any `ToolPolicy` this module builds.
+  - `FlowLabelingPolicy`/`LethalTrifectaPolicy` (`marshal_ai.flow`) — both
+    need the *same* live `FlowTracker` instance, shared between the
+    retrieval and tool surfaces; that's an object relationship, not data.
   - Any custom `Policy`/`ToolPolicy`/`ModelPolicy` subclass you've written
     yourself — this module only knows the types registered via
     `register_builder`; register your own to make it loadable, or compose
@@ -150,8 +159,10 @@ Formats
 -------
 JSON is loaded via the stdlib `json` module always. YAML support needs
 PyYAML, imported LAZILY (only when a `.yaml`/`.yml` file is actually
-loaded) via `yaml.safe_load` — never `yaml.load`, which can execute
-arbitrary Python objects from untrusted input. PyYAML is an optional
+loaded) through a `yaml.SafeLoader` subclass — never the full `Loader`,
+which can construct arbitrary Python objects — that also rejects YAML
+aliases ("billion laughs" expansion bombs pass `safe_load`). Files over
+`MAX_CONFIG_BYTES` (1 MB) are refused before parsing. PyYAML is an optional
 extra (`pip install "marshal-ai[config]"`), never a hard dependency of
 this library; loading a YAML file without it installed raises
 `PolicyConfigError` naming that exact install command, not an opaque
@@ -175,9 +186,11 @@ from marshal_ai.models import (
     ResidencyPolicy,
     RetentionPolicy,
 )
+from marshal_ai.egress import EgressAllowlist, EgressPolicy
 from marshal_ai.policy import (
     AllowAll,
     AttributePolicy,
+    DelegatedPolicy,
     FieldRedaction,
     GroupPolicy,
     Policy,
@@ -356,6 +369,11 @@ def _build_sensitive_data_policy(params: dict[str, Any], base: Policy) -> Policy
     return SensitiveDataPolicy(base=base)
 
 
+def _build_delegated_policy(params: dict[str, Any], base: Policy) -> Policy:
+    _reject_unknown(params)
+    return DelegatedPolicy(base)
+
+
 # --------------------------------------------------------------------------
 # tool_policy builders (marshal_ai.tools)
 # --------------------------------------------------------------------------
@@ -419,6 +437,14 @@ def _build_jurisdictional_risk_tier_policy(params: dict[str, Any], base: ToolPol
             for tier, outcome in tiers_dict.items()
         }
     return JurisdictionalRiskTierPolicy(base=base, overrides_by_jurisdiction=overrides)
+
+
+def _build_egress_policy(params: dict[str, Any], base: ToolPolicy) -> ToolPolicy:
+    hosts = _as_list(_require(params, "allowed_hosts"), "'allowed_hosts'")
+    on_violation = _as_str(params.pop("on_violation", "deny"), "'on_violation'")
+    _reject_unknown(params)
+    names = [_as_str(h, f"allowed_hosts[{i}]") for i, h in enumerate(hosts)]
+    return EgressPolicy(base, EgressAllowlist(names), on_violation=on_violation)  # type: ignore[arg-type]
 
 
 _KNOWN_DETECTOR_NAMES: frozenset[str] = frozenset(d.name for d in DEFAULT_DETECTORS)
@@ -528,6 +554,7 @@ register_builder("retrieval", "group", "base", _build_group_policy)
 register_builder("retrieval", "allow_all", "base", _build_allow_all_policy)
 register_builder("retrieval", "redacting", "wrapper", _build_redacting_policy)
 register_builder("retrieval", "sensitive_data", "wrapper", _build_sensitive_data_policy)
+register_builder("retrieval", "delegated", "wrapper", _build_delegated_policy)
 
 register_builder("tool", "risk_tier", "base", _build_risk_tier_policy)
 register_builder("tool", "allow_all", "base", _build_allow_all_tools)
@@ -536,6 +563,7 @@ register_builder("tool", "rate_limit", "wrapper", _build_rate_limit_policy)
 register_builder("tool", "runaway_agent", "wrapper", _build_runaway_agent_policy)
 register_builder("tool", "jurisdictional_risk_tier", "wrapper", _build_jurisdictional_risk_tier_policy)
 register_builder("tool", "sensitive_data", "wrapper", _build_sensitive_data_tool_policy)
+register_builder("tool", "egress", "wrapper", _build_egress_policy)
 
 register_builder("model", "allowlist", "base", _build_allowlist_model_policy)
 register_builder("model", "allow_all", "base", _build_allow_all_models)
@@ -620,11 +648,36 @@ def _build_surface(config_key: str, surface: str, spec: Any) -> Any:
     return policy
 
 
+# A policy file is a few KB. The cap stops a hostile or corrupted file from
+# exhausting memory before parsing even starts.
+MAX_CONFIG_BYTES = 1_000_000
+
+
 def _read_text(path: Path) -> str:
     try:
+        size = path.stat().st_size
+        if size > MAX_CONFIG_BYTES:
+            raise PolicyConfigError(f"{path}: config file is {size} bytes, over the {MAX_CONFIG_BYTES}-byte limit")
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise PolicyConfigError(f"{path}: could not read config file — {exc}") from exc
+
+
+def _no_alias_loader(yaml: Any) -> type:
+    """A `yaml.SafeLoader` that refuses YAML aliases (`*ref`). `safe_load`
+    blocks code execution but not "billion laughs" — a few nested aliases
+    expanding to gigabytes. A policy file never needs them."""
+
+    class NoAliasSafeLoader(yaml.SafeLoader):
+        def compose_node(self, parent: Any, index: Any) -> Any:
+            if self.check_event(yaml.AliasEvent):
+                event = self.peek_event()
+                raise yaml.constructor.ConstructorError(
+                    None, None, "YAML aliases are not allowed in policy files", event.start_mark
+                )
+            return super().compose_node(parent, index)
+
+    return NoAliasSafeLoader
 
 
 def _load_source(source: "str | Path | dict[str, Any]") -> Any:
@@ -645,6 +698,8 @@ def _load_source(source: "str | Path | dict[str, Any]") -> Any:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise PolicyConfigError(f"{path}: invalid JSON — {exc}") from exc
+        except RecursionError as exc:
+            raise PolicyConfigError(f"{path}: JSON nested too deeply") from exc
 
     if suffix in (".yaml", ".yml"):
         try:
@@ -656,12 +711,13 @@ def _load_source(source: "str | Path | dict[str, Any]") -> Any:
             ) from exc
         text = _read_text(path)
         try:
-            # safe_load, never yaml.load — this may be untrusted, reviewed
-            # config content, not a place to allow arbitrary Python object
-            # construction from the file.
-            return yaml.safe_load(text)
+            # A SafeLoader subclass (never the full Loader): no arbitrary
+            # Python object construction, and no aliases either.
+            return yaml.load(text, Loader=_no_alias_loader(yaml))  # noqa: S506 — a SafeLoader subclass
         except yaml.YAMLError as exc:
             raise PolicyConfigError(f"{path}: invalid YAML — {exc}") from exc
+        except RecursionError as exc:
+            raise PolicyConfigError(f"{path}: YAML nested too deeply") from exc
 
     raise PolicyConfigError(
         f"unsupported config file extension {suffix!r} for {path} — expected .json, .yaml, or .yml"

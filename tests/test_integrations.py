@@ -14,7 +14,11 @@ from marshal_ai.policy import Principal
 
 
 @pytest.fixture(autouse=True)
-def cleanup_patches():
+def cleanup_patches(monkeypatch):
+    # Depends on monkeypatch so this teardown runs *before* monkeypatch's
+    # undo: disable_all() restores whatever was there at enable() time,
+    # which in these tests is a monkeypatched fake — undoing in the other
+    # order would leak the fake into every later test.
     yield
     marshal_integrations.disable_all()
 

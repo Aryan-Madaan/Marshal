@@ -815,10 +815,177 @@ in `examples/policies.yaml` that claimed the base tool policy already
 denies `employment_decision` (it allows it; the EU wrapper is what adds
 approval).
 
+## Where `marshal_ai.flow` (the lethal-trifecta gate) sits, and why
+
+**Decision point — session state, not per-call rules.** Every existing
+policy judges one call. The attacks that actually leaked data from agents
+in 2025-2026 are made of individually normal calls; what's wrong is the
+combination one session accumulated (private data + untrusted content +
+an outbound channel). So the gate needs state across calls *and* across
+surfaces. That's the first Marshal feature where one surface's policy
+(`FlowLabelingPolicy`, retrieval) feeds another's (`LethalTrifectaPolicy`,
+tools) through a shared object (`FlowTracker`). The tracker is explicit
+and injected, not a global, so two agents never share taint by accident.
+
+**Decision point — declared labels, not detection.** A document is
+untrusted because of where it came from (a ticket, a web page), not
+because its text looks like an injection; classifiers that try the latter
+are reliably beaten by adaptive attacks. Labels come from metadata
+(`flow_labels`), defaults per retriever, and declared tool capabilities.
+The cost, stated in SECURITY.md: an unlabeled untrusted source doesn't
+taint anything, so labeling at ingestion is the operator's job.
+
+**Decision point — escalate, monotonically, only the completing call.**
+A tool that adds none of the forbidden labels is never gated however
+tainted the session is (a calculator keeps working). The completing call
+goes to `require_approval` by default, not `deny`, because "this session
+read a customer ticket and now wants to send email" is often legitimate
+and a human can tell. Like `JurisdictionalRiskTierPolicy`, it can only
+tighten. Capabilities are recorded *before* approval is answered: a
+declined call over-taints, never under-taints.
+
+**Decision point — MCP annotations only add.** `openWorldHint: true` adds
+untrusted/external capabilities; an absent hint adds nothing (the spec's
+default for an absent `openWorldHint` is true, but treating every
+unannotated tool as open-world would gate nearly everything). A server
+can never use annotations to *remove* a declared capability, since
+annotations are the server's claim.
+
+## Where `marshal_ai.egress` sits, and why
+
+**Decision point — allowlist, conservative parser.** A blocklist of bad
+hosts can't keep up; an allowlist of the few hosts an agent should reach
+can. The risk of an allowlist is a parser that sees an allowed host where
+the HTTP client sees another (`https://allowed@evil/`, backslashes,
+look-alike Unicode). Rather than emulate WHATWG parsing, anything
+ambiguous is disallowed outright, and hosts compare after IDNA encoding.
+Scheme-less `host.tld/path` is matched too, since many tools prepend the
+scheme themselves.
+
+**Decision point — model output is audited and sanitized, not blocked.**
+By the time output exists the call happened; `integrations.enable(...,
+egress_allowlist=)` audits links to other hosts, and `sanitize()` is
+offered for the renderer — the component that would actually fetch a
+markdown image.
+
+## Tool-definition pinning (`MCPToolPins`)
+
+**Decision point — hash what the model reads.** The fingerprint covers
+name, title, description, input/output schema and annotations — every
+field that reaches the model's context — and excludes transport and UI
+metadata. A changed definition is *hidden from `list_tools()`*, not just
+refused at call time, because the attack happens when the model reads
+the description.
+
+**Decision point — trust on first use by default, `on_new="deny"` for
+reviewed deployments.** TOFU keeps adoption frictionless and still catches
+the rug pull (the definition changing after you started relying on it).
+It can't catch a definition that was malicious from the start; that needs
+a review step, which `on_new="deny"` plus a committed pins file provides.
+Pins persist as plain JSON, written atomically, so they can be reviewed in
+a PR like `policies.yaml`.
+
+**Decision point — shadowing is checked only for tools a server hasn't
+had explicitly approved.** Otherwise a human who deliberately approved the
+same tool name on two servers could never use it.
+
+## Delegation (`Principal.on_behalf_of`, `DelegatedPolicy`)
+
+**Decision point — one `Principal` type with a chain, not separate
+user/agent types.** Every guard, policy and sink already takes a
+`Principal`; adding an optional `on_behalf_of` keeps every existing call
+site valid and nests naturally for multi-hop delegation (the gap the IETF
+agent-authorization drafts flag). `principal_id` stays the *actor*, so
+existing queries and reports keep meaning what they meant.
+
+**Decision point — enforcement is opt-in (`DelegatedPolicy`), recording
+is always on.** Intersecting permissions changes what existing
+deployments return, so it's a wrapper you choose. Recording the chain on
+every audit entry changes nothing for anyone and is what an
+accountability trail needs.
+
+## `ToolGuard.authorize()` and the native framework hooks
+
+**Decision point — native hooks over more monkeypatching.** Every major
+framework now has an official "may this tool run" hook. Using them is
+stable across releases in a way patching internals never is.
+`ToolGuard.authorize()` (the old `call()` minus the invocation) is the one
+decision path; `ToolGovernor` adapts its result to each framework's
+refusal shape. An allowed call through the Claude Agent SDK returns *no*
+decision rather than "allow", so the SDK's own permission prompts still
+apply: Marshal can only make a call less permitted.
+
+**Decision point — refusals go back to the model where the framework
+allows it.** LangChain, ADK and the OpenAI Agents SDK all get an error
+result the agent can reason about ("blocked by policy: ...") rather than
+an exception that kills the run. `on_deny="raise"` is there for callers
+who want the old behavior.
+
+## Full SDK coverage, and the re-entrancy guard
+
+**Decision point — patch every entry point, and fail loudly if one
+disappears.** `parse()`/`stream()` don't route through `create()`, so a
+create-only patch silently governed a fraction of real calls. The patch
+table lists all 28 entry points; if an installed SDK is missing one,
+`enable()` raises instead of patching the rest.
+
+**Decision point — a context variable, not per-call markers, to stop
+double governance.** SDKs call their own methods internally
+(`responses.stream()` ends up in `responses.create()` when the stream is
+entered), and governing the inner call again would re-resolve an
+already-resolved model name. A context variable set for the duration of a
+governed call, and across the stream manager's `__enter__`, lets the
+SDK's own inner call through while any new user call is still governed.
+
+**Decision point — hosted tools are governed at the request.** Tools the
+provider executes never pass through any client-side wrapper. The only
+honest control is refusing requests that enable them, by tool type,
+before they're sent.
+
+## `marshal_ai.incidents`
+
+**Decision point — signals, declaration and report are three separate
+steps.** Whether something is a serious incident under Article 3(49) is a
+legal judgment, so nothing is ever declared automatically.
+`incident_candidates()` is deterministic triage. `record_incident()` puts
+the human declaration, and the awareness time that starts the clock,
+into the same hash-chained trail as the evidence, so the clock can't be
+quietly moved later. The report contains counts and outcomes only, the
+same no-content discipline as every other report.
+
+## Audit findings (v0.13 pass) — what was actually broken, and the fix
+
+- **ReDoS in the shipped `EMAIL` detector.** `[A-Za-z0-9._%+-]+@...` with
+  no start boundary is quadratic on long text without an `@`: about 20
+  seconds on 100 KB, on the request path, over attacker-controlled text.
+  Fixed with a boundary lookbehind and possessive, dot-delimited domain
+  labels (now ~30 ms). Every detector and URL pattern is now timed against
+  adversarial inputs in the test suite.
+- **Governance bypass through `parse()`/`stream()`/Responses API/beta
+  messages** — see above. 22 of 28 entry points were ungoverned.
+- **Approval TOCTOU.** `call()` evaluated and executed the caller's own
+  dict; anything mutating it (including nested values) between approval
+  and execution changed what ran. Fixed by snapshotting once.
+- **Fail-open edges in `ToolGuard`.** An approval handler returning a
+  truthy non-bool counted as approval, and an unknown outcome string fell
+  through to the allow path. Both now deny; policy exceptions become an
+  audited deny with the exception type only.
+- **Claude Agent SDK MCP naming.** Tools arrived as `mcp__server__tool`
+  and were evaluated under that name, so a tier configured for the bare
+  name never applied. Now audited under the bare name with `mcp_server`
+  set; tiers may use either form.
+- **Test isolation.** The integrations test fixture's `disable_all()` ran
+  after `monkeypatch` undo, "restoring" a test's fake SDK method and
+  leaking it into later tests. The fixture now depends on `monkeypatch`.
+- **CI never ran on pushes.** The workflow triggered on `main`; the
+  branch is `master`.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the
   shared audit trail — new event kinds opt in without touching `audit.py`.
+  v0.13 adds `flow_label`, `egress`, `mcp_tool_definition` and `incident`
+  the same way.
   `marshal_ai.config.register_builder` reuses the same shape for loadable
   policy types.
 - **Strategy via constructor injection** — every `*Policy` base class is
