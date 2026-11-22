@@ -239,3 +239,89 @@ def test_litellm_guardrail_routes_models_and_governs_mcp_tool_calls():
             "call_mcp_tool",
         ))
     assert sink.all_entries()[-1].mcp_server == "billing"
+
+
+# --- Pydantic AI: a real Agent run with TestModel -----------------------------
+
+
+def test_pydantic_ai_toolset_blocks_inside_a_real_agent_run():
+    pytest.importorskip("pydantic_ai")
+    from pydantic_ai import Agent
+    from pydantic_ai.models.test import TestModel
+    from pydantic_ai.toolsets import FunctionToolset
+
+    from marshal_ai.integrations.pydantic_ai import MarshalToolset
+
+    executed = []
+    toolset = FunctionToolset()
+
+    @toolset.tool_plain
+    def lookup_order(order_id: str) -> str:
+        """Look up an order."""
+        executed.append("lookup_order")
+        return "shipped"
+
+    @toolset.tool_plain
+    def delete_account(user_id: str) -> str:
+        """Delete an account."""
+        executed.append("delete_account")
+        return "deleted"
+
+    sink = InMemoryAuditSink()
+    agent = Agent(TestModel(), toolsets=[MarshalToolset(toolset, _governor(sink))])
+    agent.run_sync("help")  # TestModel calls every tool once
+    assert executed == ["lookup_order"]
+    outcomes = {e.tool_name: e.outcome for e in sink.all_entries()}
+    assert outcomes == {"lookup_order": "allow", "delete_account": "deny"}
+
+
+# --- A2A interceptor ------------------------------------------------------------
+
+
+def _a2a_args(method, text, agent_name="billing-agent"):
+    from a2a.client.interceptors import BeforeArgs
+    from a2a.types import a2a_pb2
+
+    card = a2a_pb2.AgentCard(name=agent_name, supported_interfaces=[a2a_pb2.AgentInterface(url="https://billing.partner.example/a2a")])
+    message = a2a_pb2.Message(role=a2a_pb2.ROLE_USER, message_id="m1", parts=[a2a_pb2.Part(text=text)])
+    return BeforeArgs(input=a2a_pb2.SendMessageRequest(message=message), method=method, agent_card=card)
+
+
+def test_a2a_interceptor_governs_outbound_messages_per_remote_agent():
+    pytest.importorskip("a2a")
+    from marshal_ai import SensitiveDataToolPolicy
+    from marshal_ai.integrations.a2a import MarshalA2AInterceptor
+
+    sink = InMemoryAuditSink()
+    governor = ToolGovernor(
+        policy=SensitiveDataToolPolicy(RiskTierPolicy({"low": "allow", "high": "deny"})),
+        principal=Principal("orchestrator"),
+        risk_tiers={"a2a:billing-agent": "low", "a2a:unknown-vendor": "high"},
+        audit_sink=sink,
+    )
+    interceptor = MarshalA2AInterceptor(governor)
+
+    asyncio.run(interceptor.before(_a2a_args("send_message", "refund order 42")))
+    with pytest.raises(ToolCallDenied):
+        asyncio.run(interceptor.before(_a2a_args("send_message_streaming", "hi", agent_name="unknown-vendor")))
+    with pytest.raises(ToolCallDenied, match="sensitive data"):
+        asyncio.run(interceptor.before(_a2a_args("send_message", "our key AKIAABCDEFGHIJKLMNOP")))
+    asyncio.run(interceptor.before(_a2a_args("get_task", "")))  # read-only: not governed
+
+    assert [e.tool_name for e in sink.all_entries() if e.to_dict()["kind"] == "tool_call"] == [
+        "a2a:billing-agent", "a2a:unknown-vendor", "a2a:billing-agent",
+    ]
+
+
+# --- CrewAI hook (the logic; tests/test_crewai_real.py runs it in real CrewAI) ---
+
+
+def test_crewai_hook_returns_false_to_block():
+    from marshal_ai.integrations.crewai import marshal_tool_hook
+
+    hook = marshal_tool_hook(_governor())
+    context = type("Ctx", (), {"tool_name": "delete_account", "tool_input": {"user_id": "a"},
+                               "agent": type("A", (), {"role": "support"})()})()
+    assert hook(context) is False
+    context.tool_name = "lookup_order"
+    assert hook(context) is None

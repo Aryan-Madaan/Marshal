@@ -584,6 +584,42 @@ piece of that story, not this one.
   applied; google-adk still requires google-genai<3, so the genai floor
   stays on 2.x (tested on both).
 
+- **v0.14 — connectors, a durable approval queue, model-side loop
+  protection, and three more frameworks.**
+  - **`marshal_ai.connectors`** (closes "vector-store adapters beyond
+    Chroma/LangChain"): MongoDB Atlas Vector Search, Firestore, pgvector,
+    Qdrant, Pinecone, Elasticsearch, Weaviate and LanceDB. One neutral
+    pushdown dialect compiled per store, so a policy filters *inside* the
+    database. Only scalar values pass (no operator injection), and
+    pgvector/LanceDB use bound parameters or escaped literals. Anything
+    untranslatable falls back to post-filtering, which `RetrievalGuard`
+    always does anyway. MongoDB and pgvector are tested against real
+    servers (CI service containers), Qdrant and LanceDB run for real
+    in-process, Firestore builds real SDK queries.
+  - **`marshal_ai.approvals`** (closes "async approval queue"): a SQLite
+    queue, `QueuedApprovalHandler`, `ApprovalPending`, and a CLI for
+    reviewers. Approvals are HMAC-bound to the exact call, single-use
+    (atomic SQL), and expire. Declines hold for the TTL so a looping agent
+    can't spam reviewers. `ApprovalHandler.approved_by()` lets the audit
+    trail name the human, not the handler.
+  - **`ModelRateLimitPolicy`, `ModelRunawayPolicy`,
+    `BudgetPolicy(enforce_estimates=True)`** (closes the ModelGuard
+    rate-limit and estimate-before-call items). The SDK layer supplies a
+    prompt fingerprint and token estimates, never the prompt.
+  - **A2A, Pydantic AI, CrewAI.** A2A through its own
+    `ClientCallInterceptor` (outbound messages governed per remote agent).
+    Pydantic AI through a `WrapperToolset`, tested in a real agent run.
+    CrewAI through its `before_tool_call` hook. CrewAI deliberately has no
+    extra: every release pins mcp<2 and openai<3, so it's tested in its
+    own CI job.
+  **Found along the way**: `pending_approval` would have landed in no
+  report bucket (the v0.11 shadow-mode class of bug; added to the
+  approval outcomes). LanceDB stopped shipping Intel-macOS wheels, and uv
+  happily locked an sdist that needs a Rust toolchain plus protoc; it's
+  capped to <0.26 on that platform only. Installing CrewAI into the dev
+  environment silently downgraded mcp to 1.23 (below the security
+  floor), which is why it lives in its own job.
+
 The "fold into one library or keep tool/model governance as a separate sibling
 project" question from the original writeup below is resolved: one library.
 Shared audit infrastructure across surfaces turned out to matter more than
@@ -607,25 +643,6 @@ keeping each surface's scope maximally narrow.
   and review, not folding into the same release that shipped non-streaming
   reliability tracking.
 
-- **Vector-store adapters beyond Chroma/LangChain (Pinecone, pgvector,
-  Weaviate).** v0.11 shipped `from_chroma_collection`/
-  `from_langchain_retriever` (see Shipped above) — same pattern applies
-  cleanly to the others; add per-backend as adoption justifies rather
-  than speculatively building all three now.
-
-- **Framework hooks: the remaining gaps.** v0.13 ships native hooks for
-  LangChain, the Claude Agent SDK, ADK, the OpenAI Agents SDK and the
-  LiteLLM proxy. Not covered yet: CrewAI, Pydantic AI v2 capabilities,
-  Microsoft Agent Framework middleware, Mastra (TypeScript, out of scope
-  for a Python library). Also, the Claude Agent SDK hook could map
-  `require_approval` to the SDK's own `permissionDecision: "ask"` (the
-  user's own prompt) instead of Marshal's approval handler — needs a way
-  to audit "deferred to the host" honestly rather than as "approved".
-
-- **A2A (Agent2Agent) governance.** A2A v1.0 is a second inter-agent call
-  path next to MCP (signed Agent Cards, new operation names). Same shape
-  as `GovernedMCPSession`: wrap the client, govern `SendMessage`.
-
 - **Flow labels from more sources.** `LethalTrifectaPolicy` takes labels
   from retrieval metadata and declared tool capabilities. MCP resources
   (`read_resource`) and tool *results* (a fetched web page is untrusted
@@ -636,26 +653,11 @@ keeping each surface's scope maximally narrow.
   CPython 3.15 wheels (or Intel-macOS 3.14 wheels) yet, so the `[chroma]`
   extra is empty there. Drop the marker once onnxruntime ships them.
 
-- **Estimate-before-call budget checks.** `BudgetPolicy` today only enforces on
-  the *next* call once prior usage has been reported — it can't yet block a call
-  that would blow the budget before that call happens, since it has no way to
-  estimate cost ahead of time without a maintained per-model pricing table (a
-  real, ongoing maintenance burden — a stale table silently misreports cost,
-  worse than not tracking it at all). Worth doing once the SDK-interception
-  layer above exists, since that's the point where a pre-call estimate would
-  actually get checked.
-
 - **Messy-enterprise-data connector.** Docling handles clean PDFs/DOCX well
   already. This targets what it doesn't: call-recording transcripts, ad-hoc
   spreadsheets, normalized into retrieval-ready chunks with real provenance
   metadata — the kind of long-tail, mixed-format source mix a real
   enterprise retrieval system ends up needing to ingest.
-
-- **Async approval queue for `ToolGuard`.** `CLIApprovalHandler` blocks the
-  calling thread — fine for a script, not for a real agent that should keep
-  working on other things while a human reviews one risky call. Needs a real
-  queue (not necessarily infra — could start as a local SQLite-backed one) and
-  an `ApprovalHandler` that returns a future/pending state instead of blocking.
 
 - **`RunawayAgentPolicy`'s N-failed-calls trigger.** v0.9 shipped the
   identical-call trigger only (see Shipped below) — a parallel "N *failed*
@@ -670,18 +672,23 @@ keeping each surface's scope maximally narrow.
   is a real, separate piece of work, not a one-line addition to
   `RunawayAgentPolicy`.
 
-- **Rate limiting / runaway-loop detection for `ModelGuard`, not just
-  `ToolGuard`.** v0.9's `RateLimitPolicy`/`RunawayAgentPolicy` wrap
-  `ToolPolicy` specifically — tool calls being the more expensive/
-  consequential axis (actions, not just routing). An agent can just as
-  easily loop on *model* calls (retrying the same prompt against the same
-  model hundreds of times), and the same sliding-window mechanism applies
-  cleanly to `ModelPolicy` too. Not built alongside v0.9 because Python's
-  `ToolPolicy`/`ModelPolicy` are separate ABCs with separate request/
-  decision shapes — a literal shared class isn't possible without
-  awkward multiple inheritance, so this would be a second, `ModelPolicy`-
-  side class (distinctly named, e.g. `ModelRateLimitPolicy`), not a
-  one-line reuse of the `ToolGuard` version.
+- **Framework hooks still missing.** Microsoft Agent Framework middleware
+  (its middleware layer details weren't verifiable when v0.14 shipped),
+  and the Claude Agent SDK's `permissionDecision: "ask"` as an approval
+  route (needs an honest "deferred to the host" audit outcome).
+
+- **Agent Card pinning for A2A.** `MCPToolPins` catches an MCP server
+  rewriting a tool's description; the A2A equivalent is a remote agent's
+  card (skills, interfaces) changing after review. A2A 1.0 also defines
+  signed Agent Cards (JWS), which could be verified instead of trusted.
+
+- **Audit sinks on the connector backends.** Connectors cover retrieval
+  over MongoDB/Firestore/Postgres; durable `AuditSink`s there (with the
+  hash chain kept consistent under concurrent writers — the hard part)
+  would let teams keep the audit trail next to their data.
+
+- **CrewAI as an extra**, once a CrewAI release allows `mcp>=2.3` and
+  `openai>=3`.
 
 Add more here as they come up — pain points from real work beat cold-cloned ideas.
 

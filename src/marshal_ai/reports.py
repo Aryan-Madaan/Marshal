@@ -340,9 +340,11 @@ _GRANULARITY_FORMATS = {
 # `article12_activity_record` tracks separately, below. Without it here,
 # a shadow "require_approval" entry would land in `outcome_breakdown` but
 # in none of the three normalized buckets — silently uncounted.
+# "pending_approval" (v0.13+, a queued approval not yet decided — the call
+# did not run) is an approval-flow outcome for the same reason.
 _ALLOWED_OUTCOMES = {"allow", "approved"}
 _DENIED_OUTCOMES = {"deny", "declined"}
-_APPROVAL_OUTCOMES = {"approved", "declined", "require_approval"}
+_APPROVAL_OUTCOMES = {"approved", "declined", "require_approval", "pending_approval"}
 
 
 @dataclass(frozen=True)

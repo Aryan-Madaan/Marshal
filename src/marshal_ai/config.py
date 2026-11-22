@@ -105,7 +105,12 @@ model_policy (`marshal_ai.models`):
     list of `{model, requires_attribute?}`]).
   - `allow_all` (base) -> `AllowAllModels`: no params.
   - `budget` (wrapper) -> `BudgetPolicy`: `pricing` (dict[str, [prompt_rate,
-    completion_rate]]), `limit_usd` (number).
+    completion_rate]]), `limit_usd` (number), `enforce_estimates` (bool,
+    default false).
+  - `rate_limit` (wrapper) -> `ModelRateLimitPolicy`: `max_calls` (int),
+    `window_seconds` (number).
+  - `runaway` (wrapper) -> `ModelRunawayPolicy`: `identical_call_threshold`
+    (int), `window_seconds` (number).
   - `residency` (wrapper) -> `ResidencyPolicy`: `allowed_by_jurisdiction`
     (dict[str, dict[str, str]]).
   - `retention` (wrapper) -> `RetentionPolicy`: `deployment_retention_days`
@@ -182,6 +187,8 @@ from marshal_ai.models import (
     BudgetPolicy,
     CircuitBreakerPolicy,
     ModelCandidate,
+    ModelRateLimitPolicy,
+    ModelRunawayPolicy,
     ModelPolicy,
     ResidencyPolicy,
     RetentionPolicy,
@@ -504,6 +511,9 @@ def _build_allow_all_models(params: dict[str, Any]) -> ModelPolicy:
 def _build_budget_policy(params: dict[str, Any], base: ModelPolicy) -> ModelPolicy:
     raw_pricing = _as_dict(_require(params, "pricing"), "'pricing'")
     limit_usd = _as_number(_require(params, "limit_usd"), "'limit_usd'")
+    enforce_estimates = params.pop("enforce_estimates", False)
+    if not isinstance(enforce_estimates, bool):
+        raise PolicyConfigError(f"'enforce_estimates' must be a boolean, got {type(enforce_estimates).__name__}")
     _reject_unknown(params)
     pricing: dict[str, tuple[float, float]] = {}
     for model, rate in raw_pricing.items():
@@ -516,7 +526,21 @@ def _build_budget_policy(params: dict[str, Any], base: ModelPolicy) -> ModelPoli
         prompt_rate = _as_number(rate_list[0], f"pricing[{model!r}][0]")
         completion_rate = _as_number(rate_list[1], f"pricing[{model!r}][1]")
         pricing[model] = (prompt_rate, completion_rate)
-    return BudgetPolicy(base=base, pricing=pricing, limit_usd=limit_usd)
+    return BudgetPolicy(base=base, pricing=pricing, limit_usd=limit_usd, enforce_estimates=enforce_estimates)
+
+
+def _build_model_rate_limit_policy(params: dict[str, Any], base: ModelPolicy) -> ModelPolicy:
+    max_calls = _as_int(_require(params, "max_calls"), "'max_calls'")
+    window_seconds = _as_number(_require(params, "window_seconds"), "'window_seconds'")
+    _reject_unknown(params)
+    return ModelRateLimitPolicy(base, max_calls=max_calls, window_seconds=window_seconds)
+
+
+def _build_model_runaway_policy(params: dict[str, Any], base: ModelPolicy) -> ModelPolicy:
+    threshold = _as_int(_require(params, "identical_call_threshold"), "'identical_call_threshold'")
+    window_seconds = _as_number(_require(params, "window_seconds"), "'window_seconds'")
+    _reject_unknown(params)
+    return ModelRunawayPolicy(base, identical_call_threshold=threshold, window_seconds=window_seconds)
 
 
 def _build_residency_policy(params: dict[str, Any], base: ModelPolicy) -> ModelPolicy:
@@ -571,6 +595,8 @@ register_builder("model", "budget", "wrapper", _build_budget_policy)
 register_builder("model", "residency", "wrapper", _build_residency_policy)
 register_builder("model", "retention", "wrapper", _build_retention_policy)
 register_builder("model", "circuit_breaker", "wrapper", _build_circuit_breaker_policy)
+register_builder("model", "rate_limit", "wrapper", _build_model_rate_limit_policy)
+register_builder("model", "runaway", "wrapper", _build_model_runaway_policy)
 
 
 def _build_step(

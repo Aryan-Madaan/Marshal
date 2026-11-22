@@ -32,6 +32,9 @@ definitions. These are the guarantees it is built and tested to keep.
 | Audit-log tampering | `SQLiteAuditSink` hash chain; `anchor()` plus `verify(anchor=...)` also detects truncation and rollback | `tests/test_sinks.py` |
 | Secrets leaking into the audit trail | Entries store detector names, host names and counts, never matched text, URLs or exception messages | throughout |
 | Terminal escape injection via the CLI | Control, bidi and tag characters are escaped before printing | `tests/test_cli.py` |
+| Approval reuse or escalation | Approvals are HMAC-bound to the exact call (tool, arguments, principal chain, risk tier), single-use via one atomic SQL update, and expire | `tests/test_approvals.py` |
+| Injection through retrieval filters | Connector filters accept only scalar values and plain identifiers (no MongoDB operator injection); pgvector uses bound parameters, LanceDB escaped literals | `tests/test_connectors.py` |
+| Model-call retry loops and cost blowups | `ModelRunawayPolicy` (identical-prompt fingerprint), `ModelRateLimitPolicy`, `BudgetPolicy(enforce_estimates=True)` | `tests/test_model_policies.py` |
 | Malicious policy files | YAML aliases rejected (expansion bombs), no Python object tags, 1 MB size cap, recursion limits | `tests/test_config.py` |
 
 Stated limits, so nobody relies on something that isn't there:
@@ -54,6 +57,9 @@ Stated limits, so nobody relies on something that isn't there:
 
 - The core library has **no runtime dependencies**. Every integration is an
   optional extra.
+- CrewAI has no extra: every release pins `mcp<2` and `openai<3`, below
+  Marshal's floors (mcp below 2.3 has client-side advisories), and
+  installing it silently downgrades both. Keep it in its own environment.
 - Extras have floors at or above every known security fix for the code paths
   Marshal uses. Examples: `mcp>=2.3` (CVE-2026-116685, CVE-2026-116686), and
   `litellm>=1.110,!=1.82.7,!=1.82.8`, which excludes the malicious March 2026

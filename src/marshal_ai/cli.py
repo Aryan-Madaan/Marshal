@@ -10,6 +10,9 @@ Usage:
     python -m marshal_ai.cli tail audit.jsonl -n 20 --principal alice
     python -m marshal_ai.cli tail audit.jsonl --denied-only
     python -m marshal_ai.cli tail audit.jsonl --follow
+    python -m marshal_ai.cli approvals list approvals.db
+    python -m marshal_ai.cli approvals approve approvals.db apr-1234 --as maria@company
+    python -m marshal_ai.cli approvals decline approvals.db apr-1234 --as maria@company --note "not eligible"
 """
 
 from __future__ import annotations
@@ -103,6 +106,35 @@ def cmd_tail(args: argparse.Namespace) -> None:
         pass
 
 
+def cmd_approvals(args: argparse.Namespace) -> None:
+    from marshal_ai.approvals import ApprovalQueue
+
+    queue = ApprovalQueue(args.path)
+    try:
+        if args.action == "list":
+            pending = queue.pending()
+            if not pending:
+                print("no pending approvals")
+            for item in pending:
+                chain = f" for {'/'.join(item.on_behalf_of)}" if item.on_behalf_of else ""
+                left = max(0, int(item.expires_at - time.time()))
+                print(_terminal_safe(
+                    f"{item.id}  {item.tool_name}  by {item.principal_id}{chain}  tier={item.risk_tier}  "
+                    f"expires in {left}s  args={item.redacted_arguments}"
+                ))
+            return
+        if not args.id or not getattr(args, "approver", None):
+            raise SystemExit("approve/decline need an approval id and --as <your name>")
+        decide = queue.approve if args.action == "approve" else queue.decline
+        try:
+            result = decide(args.id, approver=args.approver, note=args.note)
+        except (KeyError, ValueError) as exc:
+            raise SystemExit(_terminal_safe(str(exc)))
+        print(_terminal_safe(f"{result.id} {result.status} by {result.decided_by}"))
+    finally:
+        queue.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="marshal_ai", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -121,6 +153,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--interval", type=float, default=1.0, help="Poll interval in seconds for --follow"
     )
     tail_parser.set_defaults(func=cmd_tail)
+
+    approvals_parser = subparsers.add_parser("approvals", help="Review a marshal_ai.approvals queue")
+    approvals_parser.add_argument("action", choices=["list", "approve", "decline"])
+    approvals_parser.add_argument("path", help="Path to the ApprovalQueue database")
+    approvals_parser.add_argument("id", nargs="?", help="Approval id (approve/decline)")
+    approvals_parser.add_argument("--as", dest="approver", help="Who is deciding (recorded in the audit trail)")
+    approvals_parser.add_argument("--note", default=None, help="Optional note recorded with the decision")
+    approvals_parser.set_defaults(func=cmd_approvals)
 
     return parser
 

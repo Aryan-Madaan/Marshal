@@ -151,9 +151,16 @@ class BudgetPolicy(ModelPolicy):
     """Wraps another policy, keeping its routing decision unchanged, and
     additionally denies once a principal's tracked spend hits `limit_usd`.
 
-    Spend is tracked per-principal, in-process, from `record_usage` calls
-    — nothing here estimates cost *before* a call executes; it enforces
-    the limit on the *next* call once prior usage has been reported. A
+    Spend is tracked per-principal, in-process, from `record_usage` calls,
+    and by default the limit is enforced on the *next* call once prior
+    usage has been reported. With `enforce_estimates=True`, a call is also
+    refused up front when its estimated cost would take the principal past
+    the limit — using `context["estimated_prompt_tokens"]` and
+    `context["max_output_tokens"]` (both filled in automatically by
+    `marshal_ai.integrations`; the prompt estimate is ~4 characters per
+    token, deliberately rough). The estimate assumes the full
+    `max_output_tokens` is used, so it errs toward refusing; a call with no
+    estimate in its context falls back to the after-the-fact check. A
     stale or missing `pricing` entry for a model is treated as
     unbudgeted/unpriced (that model's usage silently doesn't count toward
     spend) rather than raising — call out unpriced models in your own
@@ -165,19 +172,32 @@ class BudgetPolicy(ModelPolicy):
         base: ModelPolicy,
         pricing: dict[str, tuple[float, float]],
         limit_usd: float,
+        enforce_estimates: bool = False,
     ) -> None:
         # pricing: model name -> (usd per 1K prompt tokens, usd per 1K completion tokens)
         self._base = base
         self._pricing = pricing
         self._limit_usd = limit_usd
+        self._enforce_estimates = enforce_estimates
         self._spent: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    def _estimated_cost(self, model: Optional[str], context: dict[str, Any]) -> Optional[float]:
+        if model not in self._pricing:
+            return None
+        prompt = context.get("estimated_prompt_tokens")
+        output = context.get("max_output_tokens")
+        if not isinstance(prompt, int) and not isinstance(output, int):
+            return None
+        prompt_rate, completion_rate = self._pricing[model]
+        return ((prompt or 0) / 1000) * prompt_rate + ((output or 0) / 1000) * completion_rate
 
     def resolve(self, request: ModelCallRequest) -> ModelDecision:
         decision = self._base.resolve(request)
         if decision.outcome != "allow":
             return decision
-        spent = self._spent.get(request.principal.id, 0.0)
+        with self._lock:
+            spent = self._spent.get(request.principal.id, 0.0)
         if spent >= self._limit_usd:
             return ModelDecision(
                 "deny",
@@ -185,6 +205,15 @@ class BudgetPolicy(ModelPolicy):
                 f"budget exceeded for {request.principal.id!r}: "
                 f"${spent:.4f} >= ${self._limit_usd:.4f}",
             )
+        if self._enforce_estimates:
+            estimate = self._estimated_cost(decision.resolved_model, request.context)
+            if estimate is not None and spent + estimate > self._limit_usd:
+                return ModelDecision(
+                    "deny",
+                    None,
+                    f"estimated cost ${estimate:.4f} would exceed the budget for "
+                    f"{request.principal.id!r}: ${spent:.4f} spent of ${self._limit_usd:.4f}",
+                )
         return decision
 
     def fallback_chain(self, request: ModelCallRequest) -> list[str]:
@@ -212,7 +241,8 @@ class BudgetPolicy(ModelPolicy):
         self._base.record_outcome(principal, model, success, latency_ms, error)
 
     def spent_by(self, principal_id: str) -> float:
-        return self._spent.get(principal_id, 0.0)
+        with self._lock:
+            return self._spent.get(principal_id, 0.0)
 
 
 def _first_compliant(
@@ -568,6 +598,111 @@ class CircuitBreakerPolicy(ModelPolicy):
 
     def recent_failure_count(self, model: str) -> int:
         return len(self._prune(model, time.monotonic()))
+
+
+class _ModelWrapper(ModelPolicy):
+    """Passes fallback/usage/outcome reporting through to `base`."""
+
+    def __init__(self, base: ModelPolicy) -> None:
+        self._base = base
+
+    def fallback_chain(self, request: ModelCallRequest) -> list[str]:
+        return self._base.fallback_chain(request)
+
+    def record_usage(self, principal: Principal, model: str, prompt_tokens: int, completion_tokens: int) -> None:
+        self._base.record_usage(principal, model, prompt_tokens, completion_tokens)
+
+    def record_outcome(
+        self, principal: Principal, model: str, success: bool,
+        latency_ms: Optional[float] = None, error: Optional[str] = None,
+    ) -> None:
+        self._base.record_outcome(principal, model, success, latency_ms, error)
+
+
+class ModelRateLimitPolicy(_ModelWrapper):
+    """The model-call counterpart of `RateLimitPolicy`: denies once a
+    principal has made more than `max_calls` resolutions within the
+    trailing `window_seconds`. Every attempt counts, including ones the
+    base policy denies anyway."""
+
+    def __init__(self, base: ModelPolicy, max_calls: int, window_seconds: float) -> None:
+        super().__init__(base)
+        self._max_calls = max_calls
+        self._window_seconds = window_seconds
+        self._calls: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def resolve(self, request: ModelCallRequest) -> ModelDecision:
+        now = time.monotonic()
+        with self._lock:
+            recent = [t for t in self._calls.get(request.principal.id, []) if t >= now - self._window_seconds]
+            recent.append(now)
+            self._calls[request.principal.id] = recent
+            count = len(recent)
+        if count > self._max_calls:
+            return ModelDecision(
+                "deny", None,
+                f"model rate limit exceeded for {request.principal.id!r}: {count} calls within "
+                f"{self._window_seconds:.0f}s (limit {self._max_calls})",
+            )
+        return self._base.resolve(request)
+
+
+class ModelRunawayPolicy(_ModelWrapper):
+    """The model-call counterpart of `RunawayAgentPolicy`: trips a
+    principal after `identical_call_threshold` resolutions of the same
+    logical model with the same prompt within `window_seconds` — an agent
+    resending one prompt in a broken retry loop. A real conversation's
+    prompt changes every turn (it includes the history), so it never
+    looks identical.
+
+    "Same prompt" means the same `context["prompt_fingerprint"]` — a
+    SHA-256 of the prompt text that `marshal_ai.integrations` fills in
+    automatically; calls without one are never counted as identical. Like
+    `RunawayAgentPolicy`, a tripped principal stays denied until
+    `reset()` — a human decision, not a timeout."""
+
+    def __init__(self, base: ModelPolicy, identical_call_threshold: int, window_seconds: float) -> None:
+        super().__init__(base)
+        self._threshold = identical_call_threshold
+        self._window_seconds = window_seconds
+        self._recent: dict[str, list[tuple[float, str, str]]] = {}
+        self._tripped: set[str] = set()
+        self._lock = threading.Lock()
+
+    def resolve(self, request: ModelCallRequest) -> ModelDecision:
+        principal_id = request.principal.id
+        fingerprint = request.context.get("prompt_fingerprint")
+        with self._lock:
+            if principal_id in self._tripped:
+                return ModelDecision(
+                    "deny", None,
+                    f"model runaway breaker tripped for {principal_id!r} — requires a human reset()",
+                )
+            if isinstance(fingerprint, str):
+                now = time.monotonic()
+                recent = [r for r in self._recent.get(principal_id, []) if r[0] >= now - self._window_seconds]
+                recent.append((now, request.logical_name, fingerprint))
+                self._recent[principal_id] = recent
+                count = sum(1 for _, name, fp in recent if name == request.logical_name and fp == fingerprint)
+                if count >= self._threshold:
+                    self._tripped.add(principal_id)
+                    return ModelDecision(
+                        "deny", None,
+                        f"model runaway breaker tripped for {principal_id!r}: {count} identical prompts to "
+                        f"{request.logical_name!r} within {self._window_seconds:.0f}s "
+                        f"(threshold {self._threshold}) — requires a human reset()",
+                    )
+        return self._base.resolve(request)
+
+    def reset(self, principal_id: str) -> None:
+        with self._lock:
+            self._tripped.discard(principal_id)
+            self._recent.pop(principal_id, None)
+
+    def is_tripped(self, principal_id: str) -> bool:
+        with self._lock:
+            return principal_id in self._tripped
 
 
 @dataclass(frozen=True)

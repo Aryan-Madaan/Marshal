@@ -55,6 +55,63 @@ jobs:
             echo "::endgroup::"
           done
 
+  integration:
+    name: connectors against real MongoDB Atlas (local) and pgvector
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # Pinned by digest, like the actions above.
+      mongodb:
+        image: mongodb/mongodb-atlas-local@sha256:747a6c6b37b9358b45d9ecc63e4b8b6d59f8d11896d1c75f967f2520e12f4947
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping: 1})'"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      postgres:
+        image: pgvector/pgvector@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
+        env:
+          POSTGRES_USER: marshal
+          POSTGRES_PASSWORD: marshal
+          POSTGRES_DB: marshal
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U marshal"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      MARSHAL_TEST_MONGODB_URI: mongodb://127.0.0.1:27017/?directConnection=true
+      MARSHAL_TEST_PG_DSN: postgresql://marshal:marshal@127.0.0.1:5432/marshal
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - run: uv sync --locked --extra dev --python 3.13
+      - name: Connector tests (none may skip here)
+        run: |
+          uv run --no-sync pytest tests/test_connectors.py -rs | tee connector-results.txt
+          if grep -q SKIPPED connector-results.txt; then echo "a real-backend test skipped"; exit 1; fi
+
+  crewai:
+    # Every CrewAI release pins mcp<2 and openai<3, so it gets its own
+    # environment: Marshal's core (no extras) + CrewAI + pytest.
+    name: CrewAI hook in real CrewAI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - run: |
+          uv venv --python 3.13 .crewai-env
+          uv pip install --python .crewai-env/bin/python -e . "crewai>=1.15" "pytest>=9.2"
+          .crewai-env/bin/python -m pytest tests/test_crewai_real.py -rs | tee crewai-results.txt
+          if grep -q SKIPPED crewai-results.txt; then exit 1; fi
+
   audit:
     name: dependency audit
     runs-on: ubuntu-latest

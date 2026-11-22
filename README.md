@@ -156,6 +156,22 @@ New in v0.13, for agents specifically:
 - **Article 73 incident reports** (`marshal_ai.incidents`), and hardening
   of Marshal's own code and supply chain. See [`SECURITY.md`](./SECURITY.md).
 
+New in v0.14:
+
+- **Retrieval connectors** (`marshal_ai.connectors`) for MongoDB Atlas
+  Vector Search, Firestore, pgvector, Qdrant, Pinecone, Elasticsearch,
+  Weaviate and LanceDB. The access policy is compiled into each store's
+  own query, so the database never returns what the principal can't see.
+- **A durable approval queue** (`marshal_ai.approvals`). Human approval no
+  longer blocks a terminal: requests wait in SQLite, a reviewer decides
+  from anywhere (`python -m marshal_ai.cli approvals ...`), and each
+  approval releases exactly the reviewed call, exactly once.
+- **Model-side loop protection and pre-call budgets**:
+  `ModelRateLimitPolicy`, `ModelRunawayPolicy`, and
+  `BudgetPolicy(enforce_estimates=True)`.
+- **More frameworks**: A2A (agent-to-agent calls), Pydantic AI, and
+  CrewAI.
+
 See [`ideas.md`](./ideas.md) for what's next.
 
 ## Install
@@ -168,7 +184,13 @@ pip install -e ".[mcp,openai]"      # plus whichever integrations you use
 Requires Python 3.12 to 3.15. Each integration is an optional extra:
 `config`, `opentelemetry`, `openai`, `anthropic`, `google-genai`, `mcp`,
 `chroma`, `langchain`, `claude-agent-sdk`, `adk`, `openai-agents`,
-`litellm`, or `all`. The `chroma` extra is empty on Python 3.15 (and on
+`litellm`, `a2a`, `pydantic-ai`, the connector extras (`mongodb`,
+`firestore`, `pgvector`, `qdrant`, `pinecone`, `elasticsearch`,
+`weaviate`, `lancedb`), or `all`. Like `chroma`, the `weaviate` extra is
+empty on Python 3.15 for now: weaviate-client caps grpcio below the first
+release with 3.15 wheels. CrewAI has no extra: every CrewAI
+release pins `mcp<2` and `openai<3`, below what Marshal requires, so
+install it yourself in an environment without the `mcp`/`openai` extras. The `chroma` extra is empty on Python 3.15 (and on
 Intel macOS with 3.14+), because chromadb's onnxruntime dependency has no
 wheels there yet. Contributors: `uv sync --locked --extra dev` installs
 the exact, hash-locked set CI tests against.
@@ -248,6 +270,38 @@ Needs the `chroma` / `langchain` extra respectively. Run
 `python examples/chroma_example.py` for the full Chroma walkthrough
 (offline, `EphemeralClient`, no API key).
 
+## Quickstart: governed retrieval over your vector store
+
+```python
+from marshal_ai import GroupPolicy, RetrievalGuard
+from marshal_ai.connectors.mongodb import from_mongodb_atlas
+
+retriever = from_mongodb_atlas(collection, embed=my_embedder, index="vector_index")
+guard = RetrievalGuard(retriever, policy=GroupPolicy(), audit_sink=sink)
+guard.retrieve("Q3 forecast", principal)   # filtered *inside* $vectorSearch
+```
+
+| Store | Connector | The policy becomes |
+|---|---|---|
+| MongoDB Atlas Vector Search | `connectors.mongodb.from_mongodb_atlas` | `$vectorSearch` `filter` |
+| Google Cloud Firestore | `connectors.firestore.from_firestore` | `FieldFilter` on `find_nearest` |
+| PostgreSQL + pgvector | `connectors.pgvector.from_pgvector` | bound `jsonb` predicates |
+| Qdrant | `connectors.qdrant.from_qdrant` | `Filter(must=[FieldCondition])` |
+| Pinecone | `connectors.pinecone.from_pinecone` | metadata `filter` |
+| Elasticsearch | `connectors.elasticsearch.from_elasticsearch` | kNN `filter` |
+| Weaviate | `connectors.weaviate.from_weaviate` | `Filter.by_property` |
+| LanceDB | `connectors.lancedb.from_lancedb` | prefiltered `where` |
+
+Pushdown is an optimization, never the enforcement. `RetrievalGuard`
+re-checks every document, and a filter a connector can't translate safely
+isn't pushed down at all. Only scalar values pass, so nothing can be
+smuggled in as a store operator. pgvector and LanceDB build their queries
+with bound parameters or escaped literals. With pgvector you can also put
+Row-Level Security on the table, so the database enforces access too.
+MongoDB and pgvector are tested against real servers in CI, Qdrant and
+LanceDB run for real in-process, and Firestore builds real SDK queries.
+Run `python examples/connectors_example.py`.
+
 ## Quickstart: tool-call governance
 
 ```python
@@ -268,6 +322,38 @@ guard.call(hr, {"employee_id": "E123", "salary_band": "L6"}, risk_tier="medium")
 ```
 
 Run `python examples/tool_governance_example.py` for a fuller walkthrough.
+
+## Quickstart: human approval without blocking
+
+```python
+from marshal_ai.approvals import ApprovalQueue, QueuedApprovalHandler
+from marshal_ai.tools import ApprovalPending
+
+queue = ApprovalQueue("approvals.db")
+guard = ToolGuard(tool=issue_refund, policy=policy,
+                  approval_handler=QueuedApprovalHandler(queue, wait_seconds=0))
+try:
+    guard.call(agent, {"order_id": "42", "amount": 450}, risk_tier="medium")
+except ApprovalPending as pending:
+    notify_reviewers(pending.approval_id)      # Slack, a ticket, an admin page
+
+# reviewer: python -m marshal_ai.cli approvals approve approvals.db <id> --as maria@company
+guard.call(agent, {"order_id": "42", "amount": 450}, risk_tier="medium")   # now it runs, once
+```
+
+Three guarantees hold across processes:
+
+- **Bound to one call.** Each request is keyed by an HMAC of the exact
+  call (tool, arguments, principal chain, risk tier). An approval for $450
+  doesn't release $4,500. Reviewers see only the redacted arguments, and
+  raw values are never stored.
+- **Single use.** Spending an approval is one atomic SQL update.
+- **Expiry.** Unanswered requests and unused approvals expire (default
+  15 minutes).
+
+`wait_seconds > 0` polls instead of returning immediately, and
+`wait_for_decision()` waits without blocking an event loop. Run
+`python examples/approval_queue_example.py`.
 
 ## Quickstart: MCP tool-call governance
 
@@ -355,6 +441,27 @@ but healthy agent can be just as fast), and *does this jurisdiction demand
 more oversight* (jurisdictional risk tiering — monotonic, can only add
 approval requirements, never remove one the base policy already set).
 Run `python examples/agent_reliability_example.py` for all three together.
+
+## Quickstart: model-call loops and budgets
+
+```python
+from marshal_ai import BudgetPolicy, ModelRateLimitPolicy, ModelRunawayPolicy
+
+policy = BudgetPolicy(
+    ModelRunawayPolicy(ModelRateLimitPolicy(routes, max_calls=600, window_seconds=60),
+                       identical_call_threshold=5, window_seconds=60),
+    pricing=prices, limit_usd=20.0, enforce_estimates=True,
+)
+```
+
+`ModelRunawayPolicy` trips when one prompt is resent to the same model
+over and over (a broken retry loop). It stays tripped until someone calls
+`reset()`. A real conversation never trips it, because its prompt changes
+every turn. `enforce_estimates=True` refuses a call whose estimated cost,
+assuming the full `max_tokens`, would exceed the budget, *before* it's
+made. `marshal_ai.integrations` fills in the prompt fingerprint and
+token estimates automatically. The prompt text itself never reaches a
+policy.
 
 ## Quickstart: model governance
 
@@ -626,6 +733,18 @@ runner = Runner(agent=root_agent, app_name="app", session_service=svc, plugins=[
 # OpenAI Agents SDK
 from marshal_ai.integrations.openai_agents import govern_tools, marshal_tool_guardrail
 govern_tools(agent, marshal_tool_guardrail(governor))
+
+# Pydantic AI (wrap any toolset)
+from marshal_ai.integrations.pydantic_ai import MarshalToolset
+agent = Agent(model, toolsets=[MarshalToolset(toolset, governor)])
+
+# CrewAI (every tool call in every crew)
+from marshal_ai.integrations.crewai import enable_crewai
+enable_crewai(governor)
+
+# A2A: what your agent sends to *other* agents
+from marshal_ai.integrations.a2a import MarshalA2AInterceptor
+a2a_client.add_interceptor(MarshalA2AInterceptor(governor))   # governed as "a2a:<agent name>"
 ```
 
 A refused call never runs. Where the framework allows it, the model gets
@@ -1045,31 +1164,27 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.13. Governs all three surfaces (retrieval; tool calls; model calls)
-with one shared, tamper-evident audit trail. Tool-call governance covers
-risk tiers, rate limits, runaway loops, jurisdiction, and MCP. Model
-governance covers routing, budgets, data residency, retention and circuit
-breaking. Also included: shadow mode, policy-as-config, sensitive-data
-detection, OpenTelemetry export, and EU AI Act-shaped activity,
-cross-border and Article 73 incident reports.
+v0.14. Governs all three surfaces (retrieval; tool calls; model calls)
+with one shared, tamper-evident audit trail:
 
-New this release:
-- cross-surface lethal-trifecta flow control and egress allowlisting;
-- MCP 2 support with tool-definition pinning;
-- delegation (agent acting for a user);
-- native hooks for LangChain, the Claude Agent SDK, ADK, the OpenAI Agents
-  SDK and the LiteLLM proxy;
-- governance of every SDK model-call entry point, plus refusal of
-  provider-hosted tools;
-- Python 3.12 to 3.15;
-- a security pass over Marshal itself: a fixed ReDoS, Unicode-evasion
-  handling, fail-closed edges, approval TOCTOU, audit-chain anchoring, and
-  a hardened CI and release pipeline.
+- **Retrieval:** connectors for eight vector stores with in-database
+  policy pushdown, and delegation (an agent acting for a user).
+- **Tool calls:** risk tiers, rate limits, runaway loops, jurisdiction,
+  lethal-trifecta flow control, egress allowlisting, MCP with
+  tool-definition pinning, A2A, and a durable approval queue.
+- **Model calls:** routing, budgets (including pre-call estimates), data
+  residency, retention, circuit breaking, rate limits and runaway-loop
+  detection, plus refusal of provider-hosted tools. Every OpenAI,
+  Anthropic and Gemini SDK entry point is governed.
+- **Frameworks:** native hooks for LangChain, the Claude Agent SDK, ADK,
+  the OpenAI Agents SDK, Pydantic AI, CrewAI and the LiteLLM proxy.
+- **Everything else:** shadow mode, policy-as-config, sensitive-data
+  detection, OpenTelemetry export, and EU AI Act-shaped activity,
+  cross-border and Article 73 incident reports.
 
-See [`SECURITY.md`](./SECURITY.md) for the threat model and its stated
-limits, and [`ideas.md`](./ideas.md) for what's next. That includes
-A2A governance, more framework hooks, flow labels from tool results,
-time-to-first-token tracking, and adapters for Pinecone/pgvector/Weaviate.
+Supports Python 3.12 to 3.15. See [`SECURITY.md`](./SECURITY.md) for the
+threat model and its stated limits, and [`ideas.md`](./ideas.md) for
+what's next.
 
 ## License
 

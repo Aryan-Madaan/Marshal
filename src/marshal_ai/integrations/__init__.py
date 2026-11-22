@@ -104,6 +104,7 @@ detection is regex-based rather than another LLM call.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import inspect
 import re
 import time
@@ -582,6 +583,32 @@ _PATCH_TABLE: dict[str, list[tuple[str, str, str, str, str]]] = {
 }
 
 
+def _max_output_tokens(kwargs: dict) -> Optional[int]:
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        value = kwargs.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    config = kwargs.get("config")
+    value = _field(config, "max_output_tokens") if config is not None else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _request_context(kwargs: dict, extract_prompt_text: "ExtractPromptText") -> dict[str, Any]:
+    """What model policies can use about this request without seeing its
+    content: a fingerprint of the prompt (for runaway-loop detection) and
+    rough token estimates (for estimate-before-call budgets). The prompt
+    text itself never leaves this function."""
+    text = extract_prompt_text(kwargs)
+    context: dict[str, Any] = {
+        "prompt_fingerprint": hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest(),
+        "estimated_prompt_tokens": (len(text) + 3) // 4,
+    }
+    max_output = _max_output_tokens(kwargs)
+    if max_output is not None:
+        context["max_output_tokens"] = max_output
+    return context
+
+
 def _deny_hosted(guard: ModelGuard, principal: Principal, requested: Optional[str], reason: str) -> None:
     location = requested or "?"
     guard.audit_log.write(
@@ -645,7 +672,7 @@ def _make_wrapper(
         )
         _check_hosted_tools(guard, principal, requested, kwargs, extract_hosted, hosted_tools, egress)
         if requested is not None:
-            kwargs["model"] = guard.resolve(principal, requested)
+            kwargs["model"] = guard.resolve(principal, requested, _request_context(kwargs, extract_prompt_text))
         return principal
 
     def _after(principal: Principal, response, kwargs: dict) -> None:

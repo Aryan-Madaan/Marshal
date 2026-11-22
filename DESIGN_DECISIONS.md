@@ -980,6 +980,77 @@ same no-content discipline as every other report.
 - **CI never ran on pushes.** The workflow triggered on `main`; the
   branch is `master`.
 
+## Where `marshal_ai.connectors` sits, and why
+
+**Decision point — one neutral filter dialect, compiled per store.**
+Policies already speak one pushdown dialect (`GroupPolicy.to_filter`'s
+Mongo-style `{field: {"$in": [...]}}`). Rather than teach every policy
+every store, each connector compiles that dialect into the store's own
+filter (MQL, `FieldFilter`, Qdrant `Filter`, bound SQL, a LanceDB
+`where`). The dialect is deliberately tiny (equality, membership,
+conjunction), because every operator added is another thing eight
+compilers must get exactly right.
+
+**Decision point — refuse to translate rather than translate loosely.**
+A filter outside the dialect, a non-scalar value, a field name that isn't
+a plain identifier, or Firestore's 30-value `in` limit all mean *no
+pushdown*, never a best-effort guess. That is always safe, because
+`RetrievalGuard` re-checks every document: the worst case is fewer than
+k results, never a leak. Rejecting non-scalar values is also what makes
+MongoDB operator injection impossible. A value can never *be* an
+operator.
+
+**Decision point — test against real backends wherever one can run.** A
+connector tested only against a fake proves it matches the fake. MongoDB
+(`mongodb-atlas-local` supports `$vectorSearch`) and pgvector run as CI
+service containers, pinned by digest. Qdrant and LanceDB run for real
+in-process. Firestore's emulator needs a JVM plus gcloud, so the real SDK
+builds and serializes the query and only the network round trip is
+replaced. Pinecone, Elasticsearch and Weaviate (managed or heavyweight)
+use recording fakes that pin the exact request.
+
+## Where `marshal_ai.approvals` sits, and why
+
+**Decision point — bind the approval to the call, not to an id.** An
+approval id alone would let an agent get "$5 refund" approved and then
+spend that approval on a $5,000 one. The queue keys every request by an
+HMAC of (tool, raw arguments, principal chain, risk tier), and only that
+exact call can consume it. Re-submitting the identical call finds the
+existing request, which is also what makes the non-blocking flow
+("pending, retry later") work without callers passing an id back. The
+HMAC key is per queue, so the digest can't be brute-forced into
+low-entropy argument values. Reviewers only ever see the redacted view.
+
+**Decision point — SQLite again.** Same reasoning as `SQLiteAuditSink`:
+durable, transactional, zero new dependencies, safe across processes. The
+single-use guarantee is a conditional `UPDATE ... WHERE status =
+'approved'` inside `BEGIN IMMEDIATE`, which the concurrency test hammers
+with eight racing retries.
+
+**Decision point — `ApprovalPending` subclasses `ToolCallDenied`.** Code
+written before the queue existed catches `ToolCallDenied` and stops,
+which is the right default for a call that didn't run. Code that knows
+about the queue catches `ApprovalPending` first.
+
+## `ModelRunawayPolicy`: why a prompt fingerprint
+
+A model-call loop is the same prompt resent, and a real conversation
+never resends one (each turn includes the history). So "identical" is a
+SHA-256 of the extracted prompt text, computed in the SDK layer, which is
+the only layer that sees text. The policy only ever receives the digest.
+Calls with no fingerprint are never counted as identical, so the policy
+fails *open* on missing data. That's deliberate: tripping a principal
+needs evidence, and `ModelRateLimitPolicy` is the blunt backstop.
+
+## CrewAI: an adapter without an extra
+
+Every CrewAI release pins `mcp<2` and `openai<3`. Adding a `[crewai]`
+extra would make `marshal-ai[all]` unsolvable, or push users onto mcp
+versions with client-side advisories. Installing it into the dev
+environment silently downgraded mcp to 1.23. So the adapter is
+dependency-free (a plain hook function), imports CrewAI only inside
+`enable_crewai`, and is tested in its own CI job.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the

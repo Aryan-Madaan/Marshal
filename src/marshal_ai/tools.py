@@ -348,10 +348,27 @@ class RunawayAgentPolicy(ToolPolicy):
             return principal_id in self._tripped
 
 
+class ApprovalPending(ToolCallDenied):
+    """Raised (by an `ApprovalHandler`, through `ToolGuard`) when a
+    decision is outstanding and the handler doesn't block waiting for it —
+    e.g. `marshal_ai.approvals.QueuedApprovalHandler(wait_seconds=0)`. The
+    call did not run. Make the identical call again once someone has
+    decided; `approval_id` names the queued request. A subclass of
+    `ToolCallDenied`, so code that only handles denials still stops."""
+
+    def __init__(self, tool_name: str, approval_id: str) -> None:
+        self.approval_id = approval_id
+        super().__init__(tool_name, f"approval pending ({approval_id})")
+
+
 class ApprovalHandler(ABC):
     """Decides whether a REQUIRE_APPROVAL call actually proceeds. Gets the
     already-redacted arguments — never the raw ones — so an approver never
-    sees more than the policy says they should."""
+    sees more than the policy says they should.
+
+    `request_approval` must return exactly `True` to approve; anything
+    else (False, None, a truthy string, an exception) is a decline. It may
+    raise `ApprovalPending` to say "not decided yet"."""
 
     @abstractmethod
     def request_approval(
@@ -359,6 +376,13 @@ class ApprovalHandler(ABC):
     ) -> bool: ...
 
     identity: str = "approver"
+
+    def approved_by(self, request: ToolCallRequest) -> str:
+        """Who approved `request`, for the audit trail — called right after
+        `request_approval` returned True. Default: this handler's
+        `identity`. Handlers that relay a human's decision return that
+        human's name."""
+        return self.identity
 
 
 class CLIApprovalHandler(ApprovalHandler):
@@ -452,7 +476,7 @@ class ToolCallEntry:
     tool_name: str
     arguments: dict[str, Any]
     risk_tier: str
-    outcome: str  # "allow" | "deny" | "approved" | "declined" | "require_approval" (shadow only)
+    outcome: str  # "allow" | "deny" | "approved" | "declined" | "pending_approval" | "require_approval" (shadow only)
     reason: str
     approved_by: Optional[str] = None
     shadow: bool = False
@@ -607,6 +631,12 @@ class ToolGuard:
         if decision.outcome == "require_approval":
             try:
                 approved = self._approval_handler.request_approval(request, redacted)
+            except ApprovalPending as pending:
+                self._audit(
+                    request, redacted, "pending_approval", decision.reason, approved_by=None,
+                    would_redact_fields=would_redact_fields,
+                )
+                raise pending
             except Exception:
                 # An approval channel that errors (timeout, Slack down)
                 # is a decline, never an approval.
@@ -617,9 +647,13 @@ class ToolGuard:
                     would_redact_fields=would_redact_fields,
                 )
                 raise ToolCallDenied(request.tool_name, "approval declined")
+            try:
+                approver = self._approval_handler.approved_by(request)
+            except Exception:
+                approver = self._approval_handler.identity
             self._audit(
                 request, redacted, "approved", decision.reason,
-                approved_by=self._approval_handler.identity,
+                approved_by=approver,
                 would_redact_fields=would_redact_fields,
             )
         elif decision.outcome == "allow":

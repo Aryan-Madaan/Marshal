@@ -44,6 +44,8 @@ from marshal_ai.models import (
     ModelGuard,
     ModelOutcomeEntry,
     ModelPolicy,
+    ModelRateLimitPolicy,
+    ModelRunawayPolicy,
     ModelUsageEntry,
     ResidencyPolicy,
     RetentionPolicy,
@@ -100,7 +102,7 @@ from marshal_ai.reports import (
 # used for `marshal_ai.otel` and `marshal_ai.integrations`: optional-
 # backend code stays out of the core namespace, reached one import away.
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 __all__ = [
     "AuditableEvent",
@@ -152,6 +154,8 @@ __all__ = [
     "ModelGuard",
     "ModelOutcomeEntry",
     "ModelPolicy",
+    "ModelRateLimitPolicy",
+    "ModelRunawayPolicy",
     "ModelUsageEntry",
     "ResidencyPolicy",
     "RetentionPolicy",

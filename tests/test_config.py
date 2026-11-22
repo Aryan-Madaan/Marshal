@@ -582,3 +582,21 @@ def test_delegated_and_egress_policies_load_from_config():
             {"type": "egress", "allowed_hosts": [], "on_violation": "allow"}]}})
     with pytest.raises(PolicyConfigError, match="allowed_hosts"):
         load_policies({"tool_policy": {"base": {"type": "allow_all"}, "wrappers": [{"type": "egress"}]}})
+
+
+def test_model_rate_limit_runaway_and_budget_estimates_load_from_config():
+    from marshal_ai import BudgetPolicy, ModelRunawayPolicy
+
+    loaded = load_policies({"model_policy": {
+        "base": {"type": "allow_all"},
+        "wrappers": [
+            {"type": "rate_limit", "max_calls": 100, "window_seconds": 60},
+            {"type": "runaway", "identical_call_threshold": 5, "window_seconds": 30},
+            {"type": "budget", "pricing": {"m": [1, 2]}, "limit_usd": 5, "enforce_estimates": True},
+        ],
+    }})
+    assert isinstance(loaded.model_policy, BudgetPolicy)
+    assert isinstance(loaded.model_policy._base, ModelRunawayPolicy)
+    with pytest.raises(PolicyConfigError, match="enforce_estimates"):
+        load_policies({"model_policy": {"base": {"type": "allow_all"}, "wrappers": [
+            {"type": "budget", "pricing": {}, "limit_usd": 1, "enforce_estimates": "yes"}]}})

@@ -131,3 +131,31 @@ def test_untrusted_text_cannot_inject_terminal_escapes(tmp_path, capsys):
     assert "\x1b" not in out and "\x07" not in out and "‮" not in out
     assert out.count("\n") == 1  # the embedded newline did not forge a second row
     assert "\\x{1b}" in out
+
+
+def test_approvals_cli_lists_and_decides(tmp_path, capsys):
+    import pytest
+
+    from marshal_ai import Principal, RiskTierPolicy, ToolGuard
+    from marshal_ai.approvals import ApprovalQueue, QueuedApprovalHandler
+    from marshal_ai.cli import main
+    from marshal_ai.tools import ApprovalPending
+
+    db = tmp_path / "approvals.db"
+    guard = ToolGuard(
+        tool=lambda **kw: "done", policy=RiskTierPolicy({"medium": "require_approval"}),
+        approval_handler=QueuedApprovalHandler(ApprovalQueue(db)), tool_name="wire\x1b[31m_transfer",
+    )
+    with pytest.raises(ApprovalPending) as pending:
+        guard.call(Principal("agent"), {"amount": 10}, risk_tier="medium")
+
+    main(["approvals", "list", str(db)])
+    listed = capsys.readouterr().out
+    assert pending.value.approval_id in listed and "\x1b" not in listed
+
+    main(["approvals", "approve", str(db), pending.value.approval_id, "--as", "maria"])
+    assert "approved by maria" in capsys.readouterr().out
+    assert guard.call(Principal("agent"), {"amount": 10}, risk_tier="medium") == "done"
+
+    with pytest.raises(SystemExit):
+        main(["approvals", "approve", str(db), pending.value.approval_id, "--as", "maria"])  # already used
