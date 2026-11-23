@@ -77,6 +77,9 @@ retrieval_policy (`marshal_ai.policy`, `marshal_ai.sensitive`):
     `{field, requires_attribute, replacement?}`).
   - `sensitive_data` (wrapper) -> `SensitiveDataPolicy`: no params (see
     "Left Python-only" below).
+  - `flow_labels` (wrapper) -> `FlowLabelingPolicy`: `labels_field`
+    (default "flow_labels"), `default_labels` (list). Shares the load's
+    `FlowTracker` with any tool-side `lethal_trifecta` wrapper.
   - `delegated` (wrapper) -> `DelegatedPolicy`: no params. Put it last,
     so every hop of a delegation chain is checked against the full chain
     of wrappers below it.
@@ -99,6 +102,11 @@ tool_policy (`marshal_ai.tools`):
   - `sensitive_data` (wrapper) -> `SensitiveDataToolPolicy`:
     `block_detectors` (optional list of detector names — must be a subset
     of `marshal_ai.DEFAULT_DETECTORS`' names; omit for the built-in default).
+  - `lethal_trifecta` (wrapper) -> `LethalTrifectaPolicy`:
+    `tool_capabilities` (dict tool -> list of labels), `default_capabilities`
+    (list), `on_violation` ("require_approval" | "deny"). Uses the same
+    `FlowTracker` as retrieval-side `flow_labels`, exposed as
+    `LoadedPolicies.flow_tracker`.
   - `egress` (wrapper) -> `EgressPolicy`: `allowed_hosts` (list of hosts or
     `*.domain` patterns), `on_violation` ("deny" | "require_approval",
     default "deny").
@@ -143,9 +151,6 @@ further exactly as you would if you'd constructed it yourself):
     hand with the same sink your guard uses.
   - `ApprovalHandler` (`CLIApprovalHandler`/`AutoApprove`/your own) — passed
     to `ToolGuard` directly, not part of any `ToolPolicy` this module builds.
-  - `FlowLabelingPolicy`/`LethalTrifectaPolicy` (`marshal_ai.flow`) — both
-    need the *same* live `FlowTracker` instance, shared between the
-    retrieval and tool surfaces; that's an object relationship, not data.
   - Any custom `Policy`/`ToolPolicy`/`ModelPolicy` subclass you've written
     yourself — this module only knows the types registered via
     `register_builder`; register your own to make it loadable, or compose
@@ -179,6 +184,8 @@ this library; loading a YAML file without it installed raises
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -197,6 +204,7 @@ from marshal_ai.models import (
     RetentionPolicy,
 )
 from marshal_ai.egress import EgressAllowlist, EgressPolicy
+from marshal_ai.flow import FlowLabelingPolicy, FlowTracker, LethalTrifectaPolicy
 from marshal_ai.policy import (
     AllowAll,
     AttributePolicy,
@@ -249,6 +257,15 @@ class LoadedPolicies:
     retrieval_policy: Optional[Policy] = None
     tool_policy: Optional[ToolPolicy] = None
     model_policy: Optional[ModelPolicy] = None
+    # 16 hex chars of SHA-256 over the canonical JSON of the parsed config:
+    # pass it as each guard's `policy_version=` so every decision in the
+    # audit trail names the exact policy version that made it. Formatting
+    # and comment changes don't change it; any semantic change does.
+    version: Optional[str] = None
+    # The one FlowTracker shared by this load's `flow_labels` and
+    # `lethal_trifecta` wrappers (None if neither is used). Call
+    # `flow_tracker.reset(principal)` when a session ends.
+    flow_tracker: Optional["FlowTracker"] = None
 
 
 @dataclass(frozen=True)
@@ -378,6 +395,45 @@ def _build_redacting_policy(params: dict[str, Any], base: Policy) -> Policy:
 def _build_sensitive_data_policy(params: dict[str, Any], base: Policy) -> Policy:
     _reject_unknown(params)
     return SensitiveDataPolicy(base=base)
+
+
+# The FlowTracker for the load in progress: created lazily by the first
+# flow wrapper, shared by every other one in the same load_policies call.
+_LOAD_TRACKER: contextvars.ContextVar[Optional[list[FlowTracker]]] = contextvars.ContextVar(
+    "marshal_load_tracker", default=None
+)
+
+
+def _shared_tracker() -> FlowTracker:
+    holder = _LOAD_TRACKER.get()
+    if holder is None:
+        raise PolicyConfigError("flow wrappers can only be built inside load_policies")
+    if not holder:
+        holder.append(FlowTracker())
+    return holder[0]
+
+
+def _label_list(value: Any, name: str) -> list[str]:
+    return [_as_str(v, f"{name}[{i}]") for i, v in enumerate(_as_list(value, name))]
+
+
+def _build_flow_labels_policy(params: dict[str, Any], base: Policy) -> Policy:
+    labels_field = _as_str(params.pop("labels_field", "flow_labels"), "'labels_field'")
+    default_labels = _label_list(params.pop("default_labels", []), "'default_labels'")
+    _reject_unknown(params)
+    return FlowLabelingPolicy(base, _shared_tracker(), labels_field=labels_field, default_labels=default_labels)
+
+
+def _build_lethal_trifecta_policy(params: dict[str, Any], base: ToolPolicy) -> ToolPolicy:
+    raw = _as_dict(params.pop("tool_capabilities", {}), "'tool_capabilities'")
+    capabilities = {_as_str(k, "a tool name"): _label_list(v, f"tool_capabilities[{k!r}]") for k, v in raw.items()}
+    default_capabilities = _label_list(params.pop("default_capabilities", []), "'default_capabilities'")
+    on_violation = _as_str(params.pop("on_violation", "require_approval"), "'on_violation'")
+    _reject_unknown(params)
+    return LethalTrifectaPolicy(
+        base, _shared_tracker(), tool_capabilities=capabilities,
+        default_capabilities=default_capabilities, on_violation=on_violation,  # type: ignore[arg-type]
+    )
 
 
 def _build_delegated_policy(params: dict[str, Any], base: Policy) -> Policy:
@@ -595,6 +651,7 @@ register_builder("retrieval", "allow_all", "base", _build_allow_all_policy)
 register_builder("retrieval", "redacting", "wrapper", _build_redacting_policy)
 register_builder("retrieval", "sensitive_data", "wrapper", _build_sensitive_data_policy)
 register_builder("retrieval", "delegated", "wrapper", _build_delegated_policy)
+register_builder("retrieval", "flow_labels", "wrapper", _build_flow_labels_policy)
 
 register_builder("tool", "risk_tier", "base", _build_risk_tier_policy)
 register_builder("tool", "allow_all", "base", _build_allow_all_tools)
@@ -604,6 +661,7 @@ register_builder("tool", "runaway_agent", "wrapper", _build_runaway_agent_policy
 register_builder("tool", "jurisdictional_risk_tier", "wrapper", _build_jurisdictional_risk_tier_policy)
 register_builder("tool", "sensitive_data", "wrapper", _build_sensitive_data_tool_policy)
 register_builder("tool", "egress", "wrapper", _build_egress_policy)
+register_builder("tool", "lethal_trifecta", "wrapper", _build_lethal_trifecta_policy)
 register_builder("tool", "circuit_breaker", "wrapper", _build_tool_circuit_breaker_policy)
 
 register_builder("model", "allowlist", "base", _build_allowlist_model_policy)
@@ -796,12 +854,20 @@ def load_policies(source: "str | Path | dict[str, Any]") -> LoadedPolicies:
         raise PolicyConfigError(f"unknown top-level key(s) {sorted(unknown_top)}")
 
     built: dict[str, Any] = {}
-    for config_key, surface in _SURFACE_KEYS.items():
-        if config_key in data:
-            built[surface] = _build_surface(config_key, surface, data[config_key])
+    tracker_holder: list[FlowTracker] = []
+    token = _LOAD_TRACKER.set(tracker_holder)
+    try:
+        for config_key, surface in _SURFACE_KEYS.items():
+            if config_key in data:
+                built[surface] = _build_surface(config_key, surface, data[config_key])
+    finally:
+        _LOAD_TRACKER.reset(token)
 
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     return LoadedPolicies(
         retrieval_policy=built.get("retrieval"),
         tool_policy=built.get("tool"),
         model_policy=built.get("model"),
+        version=hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16],
+        flow_tracker=tracker_holder[0] if tracker_holder else None,
     )

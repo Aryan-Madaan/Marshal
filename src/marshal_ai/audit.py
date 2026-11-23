@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
+from marshal_ai._runctx import current_parent_run_id, current_run_id
 from typing import Any, Optional, Protocol
 
 
@@ -37,6 +38,13 @@ def _decode_entry(data: dict[str, Any]) -> AuditableEvent:
     data = dict(data)
     kind = data.pop("kind")
     cls = _ENTRY_TYPES[kind]
+    # Run fields default to the *current* run when an entry is created.
+    # A decoded entry was created long ago: never let it pick up whatever
+    # run happens to be active while the log is being read.
+    names = {f.name for f in fields(cls)} if is_dataclass(cls) else set()
+    for name in ("run_id", "parent_run_id"):
+        if name in names:
+            data.setdefault(name, None)
     return cls(**data)
 
 
@@ -95,7 +103,10 @@ class AuditEntry:
     denied_reasons: dict[str, str]
     shadow: bool = False
     would_redact_fields: dict[str, list[str]] = field(default_factory=dict)
+    policy_version: Optional[str] = None
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "retrieval", **asdict(self)}

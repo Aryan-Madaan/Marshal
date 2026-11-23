@@ -44,6 +44,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
+from marshal_ai._runctx import current_parent_run_id, current_run_id
 from marshal_ai.audit import AuditSink, is_denied, register_entry_type
 from marshal_ai.policy import Principal
 
@@ -78,6 +79,8 @@ class IncidentEntry:
     window_start: Optional[float] = None
     window_end: Optional[float] = None
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "incident", **asdict(self)}

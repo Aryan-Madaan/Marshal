@@ -80,6 +80,7 @@ class RetrievalGuard:
         policy: Optional[Policy] = None,
         audit_sink: Optional[AuditSink] = None,
         mode: GuardMode = "enforce",
+        policy_version: Optional[str] = None,
     ) -> None:
         self._retriever = retriever
         # Deliberately `is None`, not `or` — an empty InMemoryAuditSink()
@@ -90,6 +91,7 @@ class RetrievalGuard:
         self._audit_sink = audit_sink if audit_sink is not None else InMemoryAuditSink()
         self._retriever_accepts_filter = _accepts_filter(retriever)
         self._mode = mode
+        self._policy_version = policy_version
 
     @property
     def audit_log(self) -> AuditSink:
@@ -137,6 +139,7 @@ class RetrievalGuard:
                 denied_reasons=denied_reasons,
                 shadow=shadow,
                 would_redact_fields=would_redact_fields,
+                policy_version=self._policy_version,
                 on_behalf_of=principal.delegation_chain,
             )
         )

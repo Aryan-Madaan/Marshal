@@ -187,6 +187,26 @@ New in v0.15:
   prompt, audited as `deferred_to_host`, never as "approved".
 - **Microsoft Agent Framework** function middleware.
 
+New in v0.16, for *operating* agents, not just governing them:
+
+- **Run correlation** (`agent_run`). Every audit entry is tied to the run
+  and task it belongs to, sub-agents included, with no call-site changes.
+- **Computed health** (`assess`). Each tool, model and agent is healthy,
+  degraded, failing, idle, unknown or not instrumented, based on real
+  outcomes and heartbeats.
+- **Quarantine.** An audited, cross-process kill switch for a tool, an
+  agent or a model, usable from the CLI mid-incident.
+- **Pseudonymous audit trails** (`PseudonymizingAuditSink`). No raw
+  user or agent ids are stored, but the key holder can still query.
+- **Policy versions** on every decision, so you can tell which
+  `policies.yaml` made each call.
+- **Red-team checks** (`run_redteam`, `marshal_ai.cli redteam`). Known
+  attack patterns replayed against your own policies, in CI.
+- **Inventory, dependency graph and cost per successful run**, all
+  derived from the audit trail.
+- **The trifecta gate in policy-as-config** (`flow_labels` +
+  `lethal_trifecta`, sharing one tracker).
+
 See [`ideas.md`](./ideas.md) for what's next.
 
 ## Install
@@ -456,6 +476,43 @@ but healthy agent can be just as fast), and *does this jurisdiction demand
 more oversight* (jurisdictional risk tiering — monotonic, can only add
 approval requirements, never remove one the base policy already set).
 Run `python examples/agent_reliability_example.py` for all three together.
+
+## Quickstart: operating agents
+
+```python
+from marshal_ai import (PseudonymizingAuditSink, Quarantine, QuarantineToolPolicy, SQLiteAuditSink,
+                        agent_run, assess, build_inventory, render_health_markdown, run_costs, run_redteam)
+
+sink = PseudonymizingAuditSink(SQLiteAuditSink("audit.db"), key=key_from_your_vault)
+quarantine = Quarantine("quarantine.db", audit_sink=sink)
+tools = QuarantineToolPolicy(your_tool_policy, quarantine)
+
+with agent_run(sink, task="where-is-my-order"):      # every entry inside carries the run id
+    ...
+
+print(render_health_markdown(assess(sink, window_seconds=900)))   # what's actually failing
+build_inventory(sink).dependents_of("tool:track_shipment")         # blast radius
+run_costs(sink, pricing).by_task                                   # cost per *successful* run
+```
+
+```bash
+python -m marshal_ai.cli quarantine add quarantine.db tool track_shipment --as oncall@co --reason "carrier outage"
+python -m marshal_ai.cli health audit.db
+python -m marshal_ai.cli redteam policies.yaml --send-external send_email --destructive delete_account   # exits 1 on FAIL
+```
+
+- `assess` judges from evidence: tool and model outcomes, breaker trips,
+  denial rates and heartbeats (`record_heartbeat`). "Idle" (alive, no
+  traffic) is kept distinct from "unknown" (heartbeats stopped) and from
+  "not instrumented" (no outcome data to judge).
+- Quarantine is fail-closed: if the store can't be read, calls are
+  denied.
+- The red-team battery reports `not_applicable` for any scenario you
+  didn't configure, never a silent pass.
+
+Run `python examples/operations_example.py` for a full shift: an outage,
+the health report, a CLI quarantine, blast radius and unit cost, and a
+red-team gate that catches a missing rate limit.
 
 ## Quickstart: when tools break
 
@@ -1203,7 +1260,7 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.15. Governs all three surfaces (retrieval; tool calls; model calls)
+v0.16. Governs all three surfaces (retrieval; tool calls; model calls)
 with one shared, tamper-evident audit trail:
 
 - **Retrieval:** connectors for eight vector stores with in-database
@@ -1219,6 +1276,9 @@ with one shared, tamper-evident audit trail:
 - **Frameworks:** native hooks for LangChain, the Claude Agent SDK, ADK,
   the OpenAI Agents SDK, Pydantic AI, Microsoft Agent Framework, CrewAI
   and the LiteLLM proxy.
+- **Operations:** run correlation, computed health, quarantine,
+  pseudonymous audit trails, policy versions, red-team checks, and an
+  inventory with cost per successful run.
 - **Everything else:** shadow mode, policy-as-config, sensitive-data
   detection, OpenTelemetry export, and EU AI Act-shaped activity,
   cross-border and Article 73 incident reports.

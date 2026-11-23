@@ -77,6 +77,12 @@ from marshal_ai.flow import (
     LethalTrifectaPolicy,
 )
 from marshal_ai.egress import EgressAllowlist, EgressEntry, EgressPolicy
+from marshal_ai.runs import AgentRun, RunEntry, agent_run, current_run_id, run_summary, run_timeline
+from marshal_ai.privacy import PseudonymizingAuditSink
+from marshal_ai.quarantine import Quarantine, QuarantineEntry, QuarantineModelPolicy, QuarantineToolPolicy
+from marshal_ai.health import HealthReport, HealthThresholds, HeartbeatEntry, assess, record_heartbeat, render_health_markdown
+from marshal_ai.redteam import RedTeamReport, RedTeamTargets, render_redteam_markdown, run_redteam
+from marshal_ai.inventory import build_inventory, render_mermaid, run_costs
 from marshal_ai.incidents import (
     IncidentEntry,
     IncidentReport,
@@ -107,7 +113,7 @@ from marshal_ai.reports import (
 # used for `marshal_ai.otel` and `marshal_ai.integrations`: optional-
 # backend code stays out of the core namespace, reached one import away.
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 __all__ = [
     "AuditableEvent",
@@ -192,6 +198,30 @@ __all__ = [
     "EgressAllowlist",
     "EgressEntry",
     "EgressPolicy",
+    "AgentRun",
+    "RunEntry",
+    "agent_run",
+    "current_run_id",
+    "run_summary",
+    "run_timeline",
+    "PseudonymizingAuditSink",
+    "Quarantine",
+    "QuarantineEntry",
+    "QuarantineModelPolicy",
+    "QuarantineToolPolicy",
+    "HealthReport",
+    "HealthThresholds",
+    "HeartbeatEntry",
+    "assess",
+    "record_heartbeat",
+    "render_health_markdown",
+    "RedTeamReport",
+    "RedTeamTargets",
+    "render_redteam_markdown",
+    "run_redteam",
+    "build_inventory",
+    "render_mermaid",
+    "run_costs",
     "IncidentEntry",
     "IncidentReport",
     "IncidentSignal",

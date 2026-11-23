@@ -584,6 +584,23 @@ piece of that story, not this one.
   applied; google-adk still requires google-genai<3, so the genai floor
   stays on 2.x (tested on both).
 
+- **v0.16 — from governing agents to operating them.** Run correlation
+  (`agent_run`: every entry type carries `run_id`/`parent_run_id`,
+  defaulted from a context variable, so nothing at any call site changed;
+  `run_timeline`, `run_summary`). Computed health (`assess`, heartbeats).
+  Quarantine (SQLite, cross-process, audited, fail-closed; tools, agents
+  and models). `PseudonymizingAuditSink` (keyed HMAC pseudonyms for
+  principal ids, delegation chains and incident subjects). Policy-version
+  stamping (`LoadedPolicies.version` -> `policy_version` on every
+  decision). A deterministic red-team battery with a CLI that gates CI.
+  An inventory and dependency graph from the trail, and cost per
+  successful run per task.
+  **Found along the way**: the red-team battery immediately showed that
+  policy-as-config couldn't express the trifecta gate (it needs one
+  tracker shared across surfaces). Fixed with `flow_labels` /
+  `lethal_trifecta` config wrappers that share a per-load `FlowTracker`.
+  Also: run-id defaults would have stamped the *current* run onto entries
+  decoded from old logs; the decoder now sets them explicitly.
 - **v0.15 — tools learn whether they worked.** `ToolPolicy.record_outcome`
   (forwarded automatically by every wrapper), reported by `ToolGuard.call`,
   `GovernedMCPSession` (`is_error` counts as failure), and every framework
@@ -681,6 +698,16 @@ keeping each surface's scope maximally narrow.
 
 - **CrewAI as an extra**, once a CrewAI release allows `mcp>=2.3` and
   `openai>=3`.
+
+- **Alert delivery.** `assess` and `incident_candidates` compute what's
+  wrong. Routing that to people (webhook/Slack/email, deduplication,
+  acknowledgement) is the natural next step, but needs a delivery
+  guarantee design, not just an HTTP POST.
+
+- **Continuous evaluation hooks.** A place to attach output-quality
+  scorers (groundedness, task completion) whose results land in the same
+  trail and feed `assess`. Scorers are model-based, so this would be a
+  plug-in point, never a default.
 
 Add more here as they come up — pain points from real work beat cold-cloned ideas.
 

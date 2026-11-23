@@ -34,6 +34,9 @@ definitions. These are the guarantees it is built and tested to keep.
 | Terminal escape injection via the CLI | Control, bidi and tag characters are escaped before printing | `tests/test_cli.py` |
 | A broken tool or a failing agent loop | Outcomes reported for every call that ran; `ToolCircuitBreakerPolicy` and `RunawayAgentPolicy(failed_call_threshold=...)`; outcomes record exception types, never messages | `tests/test_tools.py` |
 | A2A agent card changed after review | `MarshalA2AInterceptor(card_pins=...)` refuses until re-approved | `tests/test_framework_adapters.py` |
+| No way to stop a compromised tool, agent or model mid-incident | `Quarantine` (cross-process, audited, fail-closed) with CLI | `tests/test_privacy_quarantine.py` |
+| Personal data in a long-lived audit trail | `PseudonymizingAuditSink`: keyed HMAC pseudonyms for every identity field | `tests/test_privacy_quarantine.py` |
+| A policy change silently reopening an attack path | `run_redteam` / `marshal_ai.cli redteam` in CI | `tests/test_redteam.py` |
 | Approval reuse or escalation | Approvals are HMAC-bound to the exact call (tool, arguments, principal chain, risk tier), single-use via one atomic SQL update, and expire | `tests/test_approvals.py` |
 | Injection through retrieval filters | Connector filters accept only scalar values and plain identifiers (no MongoDB operator injection); pgvector uses bound parameters, LanceDB escaped literals | `tests/test_connectors.py` |
 | Model-call retry loops and cost blowups | `ModelRunawayPolicy` (identical-prompt fingerprint), `ModelRateLimitPolicy`, `BudgetPolicy(enforce_estimates=True)` | `tests/test_model_policies.py` |

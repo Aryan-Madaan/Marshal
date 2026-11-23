@@ -123,6 +123,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
 
+from marshal_ai._runctx import current_parent_run_id, current_run_id
 from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
 from marshal_ai.policy import GuardMode, Principal
 from marshal_ai.tools import (
@@ -291,6 +292,8 @@ class MCPToolDefinitionEntry:
     shadowed_server: Optional[str] = None
     shadow: bool = False
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "mcp_tool_definition", **asdict(self)}
@@ -399,6 +402,7 @@ class GovernedMCPSession:
         flow_tracker: Optional["FlowTracker"] = None,
         resource_labels: Optional[dict[str, Iterable[str]]] = None,
         default_resource_labels: Iterable[str] = ("untrusted_content",),
+        policy_version: Optional[str] = None,
     ) -> None:
         self._session = session
         self._principal = principal
@@ -415,6 +419,7 @@ class GovernedMCPSession:
         self._tool_pins = tool_pins
         self._mode = mode
         self._audit_outcomes = audit_outcomes
+        self._policy_version = policy_version
         self._flow_tracker = flow_tracker
         # Longest prefix wins, so "file:///public/" can override "file:///".
         self._resource_labels = sorted(
@@ -554,6 +559,7 @@ class GovernedMCPSession:
             mode=self._mode,
             mcp_server=self._server_id,
             audit_outcomes=self._audit_outcomes,
+            policy_version=self._policy_version,
         )
         guard.authorize(self._principal, arguments, risk_tier=tier, context=call_context)
         start = time.monotonic()

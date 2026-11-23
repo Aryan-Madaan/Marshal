@@ -67,6 +67,10 @@ class OpenTelemetryAuditSink(AuditSink):
             span_name = f"marshal.{kind}"
         with self._tracer.start_as_current_span(span_name) as span:
             span.set_attribute("marshal.principal_id", entry.principal_id)
+            if data.get("run_id"):
+                span.set_attribute("marshal.run_id", data["run_id"])
+            if data.get("parent_run_id"):
+                span.set_attribute("marshal.parent_run_id", data["parent_run_id"])
             chain = data.get("on_behalf_of") or []
             if chain:
                 span.set_attribute("marshal.on_behalf_of", list(chain))
@@ -80,7 +84,7 @@ class OpenTelemetryAuditSink(AuditSink):
                 # user registered) — still export something rather than
                 # silently dropping it.
                 for key, value in data.items():
-                    if key not in ("kind", "principal_id", "on_behalf_of") and _is_span_attr_safe(value):
+                    if key not in ("kind", "principal_id", "on_behalf_of", "run_id", "parent_run_id") and _is_span_attr_safe(value):
                         span.set_attribute(f"marshal.{key}", value)
 
     def _write_retrieval(self, span: trace.Span, data: dict[str, Any]) -> None:

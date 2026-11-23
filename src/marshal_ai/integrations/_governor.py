@@ -66,6 +66,7 @@ class ToolGovernor:
         approval_handler: Optional[ApprovalHandler] = None,
         mode: GuardMode = "enforce",
         audit_outcomes: bool = False,
+        policy_version: Optional[str] = None,
     ) -> None:
         self.policy = policy
         self._principal = principal
@@ -75,6 +76,7 @@ class ToolGovernor:
         self.approval_handler = approval_handler if approval_handler is not None else CLIApprovalHandler()
         self.mode = mode
         self.audit_outcomes = audit_outcomes
+        self.policy_version = policy_version
 
     def _guard(
         self, tool_name: str, mcp_server: Optional[str], policy: Any = None,
@@ -88,6 +90,7 @@ class ToolGovernor:
             mode=self.mode,
             mcp_server=mcp_server,
             audit_outcomes=self.audit_outcomes,
+            policy_version=self.policy_version,
         )
 
     def _tier(self, tool_name: str, tier_aliases: tuple[str, ...]) -> str:

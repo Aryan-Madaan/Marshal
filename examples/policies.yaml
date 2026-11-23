@@ -6,6 +6,11 @@
 # This file is meant to be the reviewable, diffable artifact a compliance
 # reviewer who isn't a Python engineer can read, propose a change to, and
 # get approved in a PR — separate from any application code deploy.
+#
+# CI red-teams this file on every push:
+#   python -m marshal_ai.cli redteam examples/policies.yaml --send-external send_email \
+#     --read-untrusted fetch_url --read-private read_hr_record \
+#     --destructive update_employee_record --destructive-tier high
 version: 1
 
 retrieval_policy:
@@ -16,6 +21,11 @@ retrieval_policy:
     # Regardless of who's allowed to see a document, redact anything that
     # looks like a secret/PII in its content.
     - type: sensitive_data
+    # Everything in the HR knowledge base is private data; documents
+    # tagged flow_labels: [untrusted_content] (tickets, emails) are not
+    # ours. Feeds the lethal_trifecta gate on the tool side.
+    - type: flow_labels
+      default_labels: [private_data]
     # An agent acting on behalf of a user sees only what that user may
     # (and what the agent itself may) — no confused deputy.
     - type: delegated
@@ -48,6 +58,20 @@ tool_policy:
     # the exfiltration step of most prompt-injection attacks is a URL.
     - type: egress
       allowed_hosts: ["ourcompany.example", "*.ourcompany.example"]
+    # A session that has read untrusted content and private data can't
+    # also send something out without a human approving it.
+    - type: lethal_trifecta
+      tool_capabilities:
+        fetch_url: [untrusted_content]
+        read_hr_record: [private_data]
+        send_email: [external_communication]
+    # The same call 10 times in a minute is a stuck agent, not a busy one.
+    - type: runaway_agent
+      identical_call_threshold: 10
+      window_seconds: 60
+    # A credential, or invisible Unicode-tag text, in any argument blocks
+    # the call outright.
+    - type: sensitive_data
 
 model_policy:
   base:

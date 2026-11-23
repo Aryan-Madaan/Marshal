@@ -303,7 +303,7 @@ def test_absent_surfaces_are_none():
 
 def test_empty_config_yields_all_none():
     loaded = load_policies({})
-    assert loaded == LoadedPolicies(None, None, None)
+    assert (loaded.retrieval_policy, loaded.tool_policy, loaded.model_policy) == (None, None, None)
 
 
 # --- fail-closed: malformed configs always raise PolicyConfigError ----------
@@ -611,3 +611,42 @@ def test_tool_circuit_breaker_and_failed_call_threshold_load_from_config():
     ]}})
     assert isinstance(loaded.tool_policy, RunawayAgentPolicy)
     assert isinstance(loaded.tool_policy._base, ToolCircuitBreakerPolicy)
+
+
+def test_policy_version_is_stable_across_formatting_and_changes_with_semantics(tmp_path):
+    from marshal_ai import InMemoryAuditSink, Principal, ToolGuard
+
+    a = tmp_path / "a.yaml"
+    a.write_text("tool_policy:\n  base: {type: risk_tier, tiers: {low: allow}}\n", encoding="utf-8")
+    b = tmp_path / "b.json"
+    b.write_text('{"tool_policy": {"base": {"tiers": {"low": "allow"}, "type": "risk_tier"}}}', encoding="utf-8")
+    c = tmp_path / "c.yaml"
+    c.write_text("tool_policy:\n  base: {type: risk_tier, tiers: {low: deny}}\n", encoding="utf-8")
+    va, vb, vc = (load_policies(p).version for p in (a, b, c))
+    assert va == vb and va != vc and len(va) == 16
+
+    loaded = load_policies(a)
+    sink = InMemoryAuditSink()
+    ToolGuard(tool=lambda: 1, policy=loaded.tool_policy, audit_sink=sink, tool_name="t",
+              policy_version=loaded.version).call(Principal("p"), {})
+    assert sink.tail(1)[0].policy_version == va
+
+
+def test_flow_wrappers_share_one_tracker_across_surfaces():
+    from marshal_ai import Document, Principal, RetrievalGuard, ToolCallDenied, ToolGuard
+
+    loaded = load_policies({
+        "retrieval_policy": {"base": {"type": "allow_all"},
+                             "wrappers": [{"type": "flow_labels", "default_labels": ["private_data"]}]},
+        "tool_policy": {"base": {"type": "allow_all"}, "wrappers": [{"type": "lethal_trifecta", "on_violation": "deny",
+                        "tool_capabilities": {"fetch_url": ["untrusted_content"], "send_email": ["external_communication"]}}]},
+    })
+    assert loaded.flow_tracker is not None
+    agent = Principal("agent/s1")
+    RetrievalGuard(lambda q, k: [Document("d", "x")], policy=loaded.retrieval_policy).retrieve("q", agent)
+    ToolGuard(tool=lambda **kw: 1, policy=loaded.tool_policy, tool_name="fetch_url").call(agent, {})
+    with pytest.raises(ToolCallDenied, match="lethal trifecta"):
+        ToolGuard(tool=lambda **kw: 1, policy=loaded.tool_policy, tool_name="send_email").call(agent, {})
+    # a separate load gets a separate tracker
+    assert load_policies({"tool_policy": {"base": {"type": "allow_all"},
+                          "wrappers": [{"type": "lethal_trifecta"}]}}).flow_tracker is not loaded.flow_tracker

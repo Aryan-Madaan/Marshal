@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
+from marshal_ai._runctx import current_parent_run_id, current_run_id
 from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
 from marshal_ai.policy import GuardMode, Principal
 
@@ -725,7 +726,10 @@ class ModelCallEntry:
     outcome: str  # "allow" | "deny"
     reason: str
     shadow: bool = False
+    policy_version: Optional[str] = None
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "model_call", **asdict(self)}
@@ -746,6 +750,8 @@ class ModelUsageEntry:
     prompt_tokens: int
     completion_tokens: int
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "model_usage", **asdict(self)}
@@ -773,6 +779,8 @@ class ModelOutcomeEntry:
     latency_ms: Optional[float] = None
     error: Optional[str] = None
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "model_outcome", **asdict(self)}
@@ -798,10 +806,12 @@ class ModelGuard:
         policy: Optional[ModelPolicy] = None,
         audit_sink: Optional[AuditSink] = None,
         mode: GuardMode = "enforce",
+        policy_version: Optional[str] = None,
     ) -> None:
         self._policy = policy if policy is not None else AllowAllModels()
         self._audit_sink = audit_sink if audit_sink is not None else InMemoryAuditSink()
         self._mode = mode
+        self._policy_version = policy_version
 
     @property
     def audit_log(self) -> AuditSink:
@@ -859,6 +869,7 @@ class ModelGuard:
                 outcome=decision.outcome,
                 reason=decision.reason,
                 shadow=shadow,
+                policy_version=self._policy_version,
             )
         )
         if decision.outcome == "deny" and not shadow:

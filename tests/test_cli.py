@@ -159,3 +159,37 @@ def test_approvals_cli_lists_and_decides(tmp_path, capsys):
 
     with pytest.raises(SystemExit):
         main(["approvals", "approve", str(db), pending.value.approval_id, "--as", "maria"])  # already used
+
+
+def test_quarantine_health_inventory_and_redteam_commands(tmp_path, capsys):
+    import json
+
+    import pytest
+
+    from marshal_ai import JSONLAuditSink, Principal, ToolGuard
+    from marshal_ai.cli import main
+
+    q = str(tmp_path / "q.db")
+    main(["quarantine", "add", q, "tool", "wire_transfer", "--as", "oncall", "--reason", "INC-42"])
+    main(["quarantine", "list", q])
+    assert "wire_transfer" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["quarantine", "add", q, "tool", "x"])  # no --as / --reason
+    main(["quarantine", "release", q, "tool", "wire_transfer", "--as", "oncall", "--reason", "fixed"])
+    capsys.readouterr()
+
+    audit = tmp_path / "audit.jsonl"
+    guard = ToolGuard(tool=lambda **kw: 1, audit_sink=JSONLAuditSink(audit), tool_name="lookup\x1b[2J", audit_outcomes=True)
+    for _ in range(6):
+        guard.call(Principal("agent-1"), {})
+    main(["health", str(audit)])
+    out = capsys.readouterr().out
+    assert "| healthy | tool |" in out and "\x1b" not in out
+    main(["inventory", str(audit)])
+    assert capsys.readouterr().out.startswith("graph LR")
+
+    weak = tmp_path / "weak.json"
+    weak.write_text(json.dumps({"tool_policy": {"base": {"type": "allow_all"}}}))
+    with pytest.raises(SystemExit) as failed:
+        main(["redteam", str(weak), "--send-external", "send_email"])
+    assert failed.value.code == 1 and "FAIL" in capsys.readouterr().out

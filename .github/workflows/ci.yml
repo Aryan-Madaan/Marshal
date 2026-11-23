@@ -42,6 +42,11 @@ jobs:
       - name: Test
         # DeprecationWarnings are errors via pyproject.toml's filterwarnings.
         run: uv run --no-sync pytest
+      - name: Red-team the sample policy file
+        run: >-
+          uv run --no-sync python -m marshal_ai.cli redteam examples/policies.yaml
+          --send-external send_email --read-untrusted fetch_url --read-private read_hr_record
+          --destructive update_employee_record --destructive-tier high
       - name: Run every example
         run: |
           for example in examples/*.py; do

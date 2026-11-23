@@ -32,6 +32,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Literal, Optional
 from urllib.parse import urlsplit
 
+from marshal_ai._runctx import current_parent_run_id, current_run_id
 from marshal_ai.audit import AuditSink, register_entry_type
 from marshal_ai.policy import Principal
 from marshal_ai.tools import ToolCallRequest, ToolDecision, ToolPolicy
@@ -182,6 +183,8 @@ class EgressEntry:
     hosts: list[str]
     action: str  # "blocked" | "audited_only"
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "egress", **asdict(self)}

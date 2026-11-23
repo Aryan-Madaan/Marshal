@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
+from marshal_ai._runctx import current_parent_run_id, current_run_id
 from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
 from marshal_ai.policy import GuardMode, Principal
 
@@ -603,7 +604,10 @@ class ToolCallEntry:
     shadow: bool = False
     would_redact_fields: list[str] = field(default_factory=list)
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
     mcp_server: Optional[str] = None
+    policy_version: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "tool_call", **asdict(self)}
@@ -626,6 +630,8 @@ class ToolOutcomeEntry:
     latency_ms: Optional[float] = None
     error: Optional[str] = None
     on_behalf_of: list[str] = field(default_factory=list)
+    run_id: Optional[str] = field(default_factory=current_run_id)
+    parent_run_id: Optional[str] = field(default_factory=current_parent_run_id)
     mcp_server: Optional[str] = None
     shadow: bool = False
 
@@ -663,6 +669,10 @@ class ToolGuard:
     policies use. `audit_outcomes=True` additionally writes a
     `ToolOutcomeEntry` per call — off by default so existing audit trails
     keep their shape and volume.
+
+    `policy_version` is recorded on every decision entry — pass
+    `LoadedPolicies.version` so the trail says exactly which version of a
+    policy file made each decision.
     """
 
     def __init__(
@@ -675,6 +685,7 @@ class ToolGuard:
         mode: GuardMode = "enforce",
         mcp_server: Optional[str] = None,
         audit_outcomes: bool = False,
+        policy_version: Optional[str] = None,
     ) -> None:
         if tool is None and tool_name is None:
             raise ValueError("tool_name is required when no tool callable is given")
@@ -688,6 +699,7 @@ class ToolGuard:
         self._mode = mode
         self._mcp_server = mcp_server
         self._audit_outcomes = audit_outcomes
+        self._policy_version = policy_version
 
     @property
     def audit_log(self) -> AuditSink:
@@ -721,6 +733,7 @@ class ToolGuard:
                 would_redact_fields=would_redact_fields or [],
                 on_behalf_of=request.principal.delegation_chain,
                 mcp_server=self._mcp_server,
+                policy_version=self._policy_version,
             )
         )
 

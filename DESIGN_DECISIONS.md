@@ -1076,6 +1076,46 @@ answer. Recording "approved" would claim something Marshal didn't
 observe, so the outcome is `deferred_to_host`, and whether the tool then
 ran shows up as an outcome entry.
 
+## Operating agents (v0.16)
+
+**Run ids from a context variable, as a field default.** Every entry type
+gets `run_id: Optional[str] = field(default_factory=current_run_id)`. An
+explicit parameter would have meant touching every guard, every adapter,
+and every framework's call path Marshal doesn't control. A context
+variable follows asyncio tasks and `copy_context()`, so it reaches inside
+frameworks too. The one trap is decoding: an entry rebuilt from an old
+log line would call the factory and inherit whatever run is active
+*while reading*. `_decode_entry` sets both run fields explicitly before
+constructing.
+
+**Health is computed, and "no data" is three different states.** A
+system that says "healthy" whenever nothing is wrong *in the data it has*
+hides outages. `idle` (alive, no traffic), `unknown` (heartbeats
+stopped) and `not_instrumented` (decisions but never any outcomes) are
+separate statuses on purpose, because each needs a different response.
+Small samples are reported as low confidence rather than judged.
+
+**Quarantine fails closed and is accountable.** It's the one control a
+human flips during an incident. If its store is unreadable, the safe
+assumption is "everything might be quarantined", so calls are denied.
+Every action requires who and why, and is both audited and kept in its
+own history table.
+
+**Pseudonyms by keyed HMAC, not a lookup table.** A table mapping
+pseudonyms to people is exactly the thing to steal. A keyed HMAC gives
+deterministic pseudonyms (every analysis still works) that only the key
+holder can recompute, and there's nothing else to leak.
+
+**Red-team checks take factories.** Policies are stateful (rate limits,
+flow tracking, breakers), so scenarios must not share an instance, or
+one scenario's flood would decide another's outcome. A zero-argument
+factory per scenario keeps them independent and deterministic. Anything
+not configured is `not_applicable`, never a pass.
+
+**Policy versions hash the parsed config.** Hashing the file would change
+on a comment or a reformat. Hashing the canonical JSON of what was parsed
+changes exactly when the meaning does.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the
