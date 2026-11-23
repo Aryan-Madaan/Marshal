@@ -325,3 +325,119 @@ def test_crewai_hook_returns_false_to_block():
     assert hook(context) is False
     context.tool_name = "lookup_order"
     assert hook(context) is None
+
+
+# --- Microsoft Agent Framework function middleware ---------------------------
+
+
+def test_agent_framework_middleware_short_circuits_and_reports_outcomes():
+    af = pytest.importorskip("agent_framework")
+    from marshal_ai import ToolCircuitBreakerPolicy
+    from marshal_ai.integrations.agent_framework import MarshalFunctionMiddleware
+
+    executed = []
+
+    @af.tool
+    def delete_account(user_id: str) -> str:
+        """Delete an account."""
+        executed.append(user_id)
+        return "deleted"
+
+    @af.tool
+    def flaky_lookup(order_id: str) -> str:
+        """Look up an order."""
+        raise TimeoutError("backend down")
+
+    sink = InMemoryAuditSink()
+    governor = ToolGovernor(
+        policy=ToolCircuitBreakerPolicy(RiskTierPolicy({"low": "allow", "high": "deny"}), failure_threshold=2, window_seconds=60),
+        principal=Principal("agent"), risk_tiers={"delete_account": "high", "flaky_lookup": "low"},
+        audit_sink=sink, audit_outcomes=True,
+    )
+    middleware = MarshalFunctionMiddleware(governor)
+
+    blocked = af.FunctionInvocationContext(function=delete_account, arguments={"user_id": "a"})
+
+    async def run_tool(context):
+        async def call_next():
+            context.result = await context.function.invoke(arguments=context.arguments)
+        await middleware.process(context, call_next)
+        return context
+
+    asyncio.run(run_tool(blocked))
+    assert executed == [] and "blocked by policy" in blocked.result
+
+    for _ in range(2):  # two real failures trip the breaker for this tool
+        with pytest.raises(Exception):
+            asyncio.run(run_tool(af.FunctionInvocationContext(function=flaky_lookup, arguments={"order_id": "1"})))
+    tripped = asyncio.run(run_tool(af.FunctionInvocationContext(function=flaky_lookup, arguments={"order_id": "1"})))
+    assert "circuit breaker open" in tripped.result
+    outcomes = [e for e in sink.all_entries() if e.to_dict()["kind"] == "tool_outcome"]
+    assert [o.success for o in outcomes] == [False, False] and outcomes[0].error is not None
+
+
+def test_governor_forced_denials_audit_the_real_reason():
+    sink = InMemoryAuditSink()
+    result = _governor(sink).check("lookup_order", "not-a-dict")
+    assert not result.allowed
+    assert "JSON object" in sink.tail(1)[0].reason
+
+
+# --- Claude Agent SDK: "ask" and outcomes -------------------------------------
+
+
+def test_claude_hook_can_defer_approval_to_the_sdk_prompt_and_reports_outcomes():
+    from marshal_ai.integrations.claude_agent_sdk import marshal_hooks
+
+    sink = InMemoryAuditSink()
+    governor = _governor(sink)
+    governor.audit_outcomes = True
+    hooks = marshal_hooks(governor, ask_for_approval=True)
+    pre, post = hooks["PreToolUse"][0].hooks[0], hooks["PostToolUseFailure"][0].hooks[0]
+
+    asked = asyncio.run(pre({"hook_event_name": "PreToolUse", "tool_name": "issue_refund",
+                             "tool_input": {"amount": 20}}, "tu_1", None))
+    assert asked["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert sink.tail(1)[0].outcome == "deferred_to_host"  # never "approved"
+
+    denied = asyncio.run(pre({"hook_event_name": "PreToolUse", "tool_name": "delete_account",
+                              "tool_input": {}}, "tu_2", None))
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"  # denials stay denials
+
+    asyncio.run(post({"hook_event_name": "PostToolUseFailure", "tool_name": "issue_refund",
+                      "tool_input": {"amount": 20}, "error": "card 4111... declined", "duration_ms": 812}, "tu_1", None))
+    outcome = sink.tail(1)[0]
+    assert outcome.success is False and outcome.error == "tool_error" and outcome.latency_ms == 812
+    assert "4111" not in str(outcome.to_dict())
+
+
+# --- A2A agent-card pinning ----------------------------------------------------
+
+
+def test_a2a_agent_card_changes_are_refused_until_re_approved():
+    pytest.importorskip("a2a")
+    from a2a.client.interceptors import BeforeArgs
+    from a2a.types import a2a_pb2
+
+    from marshal_ai.integrations.a2a import MarshalA2AInterceptor, agent_card_fingerprint
+    from marshal_ai.mcp import MCPToolPins
+
+    def args(skills):
+        card = a2a_pb2.AgentCard(name="billing-agent", description="Billing",
+                                 skills=[a2a_pb2.AgentSkill(id=s, name=s, description=s) for s in skills])
+        message = a2a_pb2.Message(role=a2a_pb2.ROLE_USER, message_id="m", parts=[a2a_pb2.Part(text="hi")])
+        return BeforeArgs(input=a2a_pb2.SendMessageRequest(message=message), method="send_message", agent_card=card)
+
+    sink = InMemoryAuditSink()
+    governor = ToolGovernor(principal=Principal("orchestrator"), audit_sink=sink)
+    pins = MCPToolPins()
+    interceptor = MarshalA2AInterceptor(governor, card_pins=pins)
+
+    asyncio.run(interceptor.before(args(["refunds"])))  # first sight: pinned
+    changed = args(["refunds", "wire_transfers"])         # a new skill appears
+    with pytest.raises(ToolCallDenied, match="changed since it was pinned"):
+        asyncio.run(interceptor.before(changed))
+    assert "changed since it was pinned" in sink.tail(1)[0].reason
+
+    pins.approve("a2a", "billing-agent", agent_card_fingerprint(changed.agent_card))
+    asyncio.run(interceptor.before(changed))

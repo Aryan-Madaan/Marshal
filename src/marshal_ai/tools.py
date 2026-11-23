@@ -61,6 +61,24 @@ class ToolPolicy(ABC):
         """
         return dict(request.arguments)
 
+    def record_outcome(
+        self,
+        request: ToolCallRequest,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Called after an allowed call actually ran — success or failure —
+        so reliability-tracking policies (`ToolCircuitBreakerPolicy`,
+        `RunawayAgentPolicy(failed_call_threshold=...)`) learn what really
+        happened. A governance denial is never reported here: a call that
+        never ran didn't fail. `error` is an exception *type* name, never
+        a message. Default: forward to a wrapped `_base` policy, if any,
+        so every wrapper passes outcomes through without opting in."""
+        base = getattr(self, "_base", None)
+        if isinstance(base, ToolPolicy):
+            base.record_outcome(request, success, latency_ms, error)
+
 
 class AllowAllTools(ToolPolicy):
     """No enforcement — audit trail only. The default if you don't pass a
@@ -273,22 +291,26 @@ class RunawayAgentPolicy(ToolPolicy):
     decision that the loop is actually fixed, not a timeout guessing that
     it might be.
 
-    Scope, stated plainly: only the identical-call trigger is implemented
-    here. A parallel "N *failed* calls" trigger was also considered, but
-    it needs `ToolGuard` to report call outcomes the way `ModelGuard.
-    record_outcome` does — that plumbing doesn't exist yet for tool calls,
-    so it's tracked as a named follow-up in `ideas.md` rather than
-    bundled into this class before the mechanism it would depend on
-    exists.
+    `failed_call_threshold` (v0.15+) adds the second trigger: a principal
+    whose calls *fail* that many times within `window_seconds` — an agent
+    hammering a broken tool or retrying malformed arguments — trips the
+    same way. Fed by `record_outcome`, which `ToolGuard.call()` reports
+    automatically for every call that actually ran.
     """
 
     def __init__(
-        self, base: ToolPolicy, identical_call_threshold: int, window_seconds: float
+        self,
+        base: ToolPolicy,
+        identical_call_threshold: int,
+        window_seconds: float,
+        failed_call_threshold: Optional[int] = None,
     ) -> None:
         self._base = base
         self._identical_call_threshold = identical_call_threshold
         self._window_seconds = window_seconds
+        self._failed_call_threshold = failed_call_threshold
         self._recent_calls: dict[str, list[tuple[float, str, dict[str, Any]]]] = {}
+        self._recent_failures: dict[str, list[float]] = {}
         self._tripped: set[str] = set()
         self._lock = threading.Lock()
 
@@ -335,6 +357,25 @@ class RunawayAgentPolicy(ToolPolicy):
     def redact_arguments(self, request: ToolCallRequest) -> dict[str, Any]:
         return self._base.redact_arguments(request)
 
+    def record_outcome(
+        self,
+        request: ToolCallRequest,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self._base.record_outcome(request, success, latency_ms, error)
+        if success or self._failed_call_threshold is None:
+            return
+        principal_id = request.principal.id
+        now = time.monotonic()
+        with self._lock:
+            recent = [t for t in self._recent_failures.get(principal_id, []) if t >= now - self._window_seconds]
+            recent.append(now)
+            self._recent_failures[principal_id] = recent
+            if len(recent) >= self._failed_call_threshold:
+                self._tripped.add(principal_id)
+
     def reset(self, principal_id: str) -> None:
         """Clear a tripped principal so they can call tools again — the
         explicit human decision this class requires instead of a timeout.
@@ -342,10 +383,65 @@ class RunawayAgentPolicy(ToolPolicy):
         with self._lock:
             self._tripped.discard(principal_id)
             self._recent_calls.pop(principal_id, None)
+            self._recent_failures.pop(principal_id, None)
 
     def is_tripped(self, principal_id: str) -> bool:
         with self._lock:
             return principal_id in self._tripped
+
+
+class ToolCircuitBreakerPolicy(ToolPolicy):
+    """The tool-call counterpart of `CircuitBreakerPolicy`: denies calls
+    to a *tool* that has failed `failure_threshold` or more times within
+    the trailing `window_seconds`, across all principals — a broken or
+    overloaded downstream service, not one agent's bug (that's
+    `RunawayAgentPolicy(failed_call_threshold=...)`). Self-healing the
+    same way as the model breaker: once failures age out of the window,
+    calls are allowed again. A governance denial never counts as a
+    failure; only calls that actually ran and raised (or, through
+    `GovernedMCPSession`, returned `is_error`) do."""
+
+    def __init__(self, base: ToolPolicy, failure_threshold: int, window_seconds: float) -> None:
+        self._base = base
+        self._failure_threshold = failure_threshold
+        self._window_seconds = window_seconds
+        self._failures: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def _recent(self, tool_name: str) -> int:
+        cutoff = time.monotonic() - self._window_seconds
+        with self._lock:
+            recent = [t for t in self._failures.get(tool_name, []) if t >= cutoff]
+            self._failures[tool_name] = recent
+            return len(recent)
+
+    def evaluate(self, request: ToolCallRequest) -> ToolDecision:
+        failures = self._recent(request.tool_name)
+        if failures >= self._failure_threshold:
+            return ToolDecision(
+                "deny",
+                f"circuit breaker open for tool {request.tool_name!r}: {failures} failures in the "
+                f"last {self._window_seconds:.0f}s (threshold {self._failure_threshold})",
+            )
+        return self._base.evaluate(request)
+
+    def redact_arguments(self, request: ToolCallRequest) -> dict[str, Any]:
+        return self._base.redact_arguments(request)
+
+    def record_outcome(
+        self,
+        request: ToolCallRequest,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self._base.record_outcome(request, success, latency_ms, error)
+        if not success:
+            with self._lock:
+                self._failures.setdefault(request.tool_name, []).append(time.monotonic())
+
+    def recent_failure_count(self, tool_name: str) -> int:
+        return self._recent(tool_name)
 
 
 class ApprovalPending(ToolCallDenied):
@@ -356,9 +452,24 @@ class ApprovalPending(ToolCallDenied):
     decided; `approval_id` names the queued request. A subclass of
     `ToolCallDenied`, so code that only handles denials still stops."""
 
+    audit_outcome = "pending_approval"
+
     def __init__(self, tool_name: str, approval_id: str) -> None:
         self.approval_id = approval_id
         super().__init__(tool_name, f"approval pending ({approval_id})")
+
+
+class ApprovalDeferredToHost(ApprovalPending):
+    """The approval decision was handed to the host application's own
+    permission prompt (e.g. the Claude Agent SDK's "ask"), which Marshal
+    doesn't see the answer to. Audited as `"deferred_to_host"` — never as
+    "approved", since Marshal didn't observe an approval."""
+
+    audit_outcome = "deferred_to_host"
+
+    def __init__(self, tool_name: str) -> None:
+        super().__init__(tool_name, "host")
+        self.reason = "approval deferred to the host's own permission prompt"
 
 
 class ApprovalHandler(ABC):
@@ -383,6 +494,16 @@ class ApprovalHandler(ABC):
         `identity`. Handlers that relay a human's decision return that
         human's name."""
         return self.identity
+
+
+class DeferToHostApprovalHandler(ApprovalHandler):
+    """Hands every approval decision to the host (see
+    `ApprovalDeferredToHost`)."""
+
+    identity = "host"
+
+    def request_approval(self, request: ToolCallRequest, redacted_arguments: dict[str, Any]) -> bool:
+        raise ApprovalDeferredToHost(request.tool_name)
 
 
 class CLIApprovalHandler(ApprovalHandler):
@@ -476,7 +597,7 @@ class ToolCallEntry:
     tool_name: str
     arguments: dict[str, Any]
     risk_tier: str
-    outcome: str  # "allow" | "deny" | "approved" | "declined" | "pending_approval" | "require_approval" (shadow only)
+    outcome: str  # "allow" | "deny" | "approved" | "declined" | "pending_approval" | "deferred_to_host" | "require_approval" (shadow only)
     reason: str
     approved_by: Optional[str] = None
     shadow: bool = False
@@ -489,6 +610,30 @@ class ToolCallEntry:
 
 
 register_entry_type("tool_call", ToolCallEntry)
+
+
+@dataclass(frozen=True)
+class ToolOutcomeEntry:
+    """Whether an allowed tool call actually worked, and how long it took
+    — the tool-side `ModelOutcomeEntry`. `error` is the exception type
+    name (e.g. `"TimeoutError"`), never its message, which could echo
+    argument values."""
+
+    timestamp: float
+    principal_id: str
+    tool_name: str
+    success: bool
+    latency_ms: Optional[float] = None
+    error: Optional[str] = None
+    on_behalf_of: list[str] = field(default_factory=list)
+    mcp_server: Optional[str] = None
+    shadow: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": "tool_outcome", **asdict(self)}
+
+
+register_entry_type("tool_outcome", ToolOutcomeEntry)
 
 
 Tool = Callable[..., Any]
@@ -512,6 +657,12 @@ class ToolGuard:
     framework's own dispatcher, an MCP server — and Marshal only needs to
     decide whether it may run: call `authorize()` instead of `call()`.
     `tool_name` is then required.
+
+    Outcomes: every call that actually runs is reported to the policy's
+    `record_outcome` (success/failure, latency), which reliability
+    policies use. `audit_outcomes=True` additionally writes a
+    `ToolOutcomeEntry` per call — off by default so existing audit trails
+    keep their shape and volume.
     """
 
     def __init__(
@@ -523,6 +674,7 @@ class ToolGuard:
         tool_name: Optional[str] = None,
         mode: GuardMode = "enforce",
         mcp_server: Optional[str] = None,
+        audit_outcomes: bool = False,
     ) -> None:
         if tool is None and tool_name is None:
             raise ValueError("tool_name is required when no tool callable is given")
@@ -535,6 +687,7 @@ class ToolGuard:
         self._tool_name = tool_name or getattr(tool, "__name__", "tool")
         self._mode = mode
         self._mcp_server = mcp_server
+        self._audit_outcomes = audit_outcomes
 
     @property
     def audit_log(self) -> AuditSink:
@@ -633,7 +786,7 @@ class ToolGuard:
                 approved = self._approval_handler.request_approval(request, redacted)
             except ApprovalPending as pending:
                 self._audit(
-                    request, redacted, "pending_approval", decision.reason, approved_by=None,
+                    request, redacted, pending.audit_outcome, decision.reason, approved_by=None,
                     would_redact_fields=would_redact_fields,
                 )
                 raise pending
@@ -673,6 +826,48 @@ class ToolGuard:
             raise ToolCallDenied(request.tool_name, reason)
         return decision
 
+    def record_outcome(
+        self,
+        principal: Principal,
+        arguments: dict[str, Any],
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+        risk_tier: str = "low",
+        context: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Report what happened to a call `authorize()` allowed and
+        something else executed (a framework, an MCP server). `call()`
+        does this itself. Feeds the policy's `record_outcome` (which
+        reliability policies use) and, with `audit_outcomes=True`, writes
+        a `ToolOutcomeEntry`."""
+        request = ToolCallRequest(
+            tool_name=self._tool_name, arguments=arguments, principal=principal,
+            risk_tier=risk_tier, context=context or {},
+        )
+        try:
+            self._policy.record_outcome(request, success, latency_ms, error)
+        finally:
+            if self._audit_outcomes:
+                self._write_outcome(principal, success, latency_ms, error)
+
+    def _write_outcome(
+        self, principal: Principal, success: bool, latency_ms: Optional[float], error: Optional[str]
+    ) -> None:
+        self._audit_sink.write(
+            ToolOutcomeEntry(
+                timestamp=time.time(),
+                principal_id=principal.id,
+                tool_name=self._tool_name,
+                success=success,
+                latency_ms=latency_ms,
+                error=error,
+                on_behalf_of=principal.delegation_chain,
+                mcp_server=self._mcp_server,
+                shadow=self._mode == "shadow",
+            )
+        )
+
     def call(
         self,
         principal: Principal,
@@ -697,4 +892,14 @@ class ToolGuard:
         # nested in it) while an approval is pending can change what runs.
         arguments = _snapshot(arguments)
         self.authorize(principal, arguments, risk_tier=risk_tier, context=context)
-        return self._tool(**arguments)
+        start = time.monotonic()
+        try:
+            result = self._tool(**arguments)
+        except Exception as exc:
+            self.record_outcome(
+                principal, arguments, False, (time.monotonic() - start) * 1000,
+                type(exc).__name__, risk_tier, context,
+            )
+            raise
+        self.record_outcome(principal, arguments, True, (time.monotonic() - start) * 1000, None, risk_tier, context)
+        return result

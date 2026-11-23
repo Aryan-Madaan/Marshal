@@ -15,10 +15,13 @@ from marshal_ai.policy import (
 )
 from marshal_ai.tools import (
     AllowAllTools,
+    ApprovalDeferredToHost,
     ApprovalHandler,
+    ApprovalPending,
     ArgumentRedaction,
     AutoApprove,
     CLIApprovalHandler,
+    DeferToHostApprovalHandler,
     JurisdictionalRiskTierPolicy,
     RateLimitPolicy,
     RedactingToolPolicy,
@@ -27,8 +30,10 @@ from marshal_ai.tools import (
     ToolCallDenied,
     ToolCallEntry,
     ToolCallRequest,
+    ToolCircuitBreakerPolicy,
     ToolDecision,
     ToolGuard,
+    ToolOutcomeEntry,
     ToolPolicy,
 )
 from marshal_ai.models import (
@@ -102,7 +107,7 @@ from marshal_ai.reports import (
 # used for `marshal_ai.otel` and `marshal_ai.integrations`: optional-
 # backend code stays out of the core namespace, reached one import away.
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 __all__ = [
     "AuditableEvent",
@@ -128,6 +133,9 @@ __all__ = [
     "RedactingPolicy",
     "AllowAllTools",
     "ApprovalHandler",
+    "ApprovalPending",
+    "ApprovalDeferredToHost",
+    "DeferToHostApprovalHandler",
     "ArgumentRedaction",
     "AutoApprove",
     "CLIApprovalHandler",
@@ -139,8 +147,10 @@ __all__ = [
     "ToolCallDenied",
     "ToolCallEntry",
     "ToolCallRequest",
+    "ToolCircuitBreakerPolicy",
     "ToolDecision",
     "ToolGuard",
+    "ToolOutcomeEntry",
     "ToolPolicy",
     "AllowAllModels",
     "AllowlistModelPolicy",

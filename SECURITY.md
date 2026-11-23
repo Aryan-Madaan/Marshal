@@ -32,6 +32,8 @@ definitions. These are the guarantees it is built and tested to keep.
 | Audit-log tampering | `SQLiteAuditSink` hash chain; `anchor()` plus `verify(anchor=...)` also detects truncation and rollback | `tests/test_sinks.py` |
 | Secrets leaking into the audit trail | Entries store detector names, host names and counts, never matched text, URLs or exception messages | throughout |
 | Terminal escape injection via the CLI | Control, bidi and tag characters are escaped before printing | `tests/test_cli.py` |
+| A broken tool or a failing agent loop | Outcomes reported for every call that ran; `ToolCircuitBreakerPolicy` and `RunawayAgentPolicy(failed_call_threshold=...)`; outcomes record exception types, never messages | `tests/test_tools.py` |
+| A2A agent card changed after review | `MarshalA2AInterceptor(card_pins=...)` refuses until re-approved | `tests/test_framework_adapters.py` |
 | Approval reuse or escalation | Approvals are HMAC-bound to the exact call (tool, arguments, principal chain, risk tier), single-use via one atomic SQL update, and expire | `tests/test_approvals.py` |
 | Injection through retrieval filters | Connector filters accept only scalar values and plain identifiers (no MongoDB operator injection); pgvector uses bound parameters, LanceDB escaped literals | `tests/test_connectors.py` |
 | Model-call retry loops and cost blowups | `ModelRunawayPolicy` (identical-prompt fingerprint), `ModelRateLimitPolicy`, `BudgetPolicy(enforce_estimates=True)` | `tests/test_model_policies.py` |

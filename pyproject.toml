@@ -1,6 +1,6 @@
 [project]
 name = "marshal-ai"
-version = "0.14.0"
+version = "0.15.0"
 description = "Governance for AI agents: permission-aware retrieval with delegation (agent acting for a user), tool-call approval and lethal-trifecta flow control across retrieval and tools, egress allowlisting, MCP tool-call governance with tool-definition pinning, model routing/budgets/data-residency/reliability with provider-hosted-tool control, native hooks for LangChain, the Claude Agent SDK, Google ADK, the OpenAI Agents SDK and LiteLLM, and a durable, tamper-evident audit trail with EU AI Act-shaped compliance and Article 73 incident reports — one library, one place to see what happened."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -75,9 +75,10 @@ lancedb = [
 # pins mcp<2 and openai<3 (see marshal_ai/integrations/crewai.py).
 a2a = ["a2a-sdk>=1.3"]
 pydantic-ai = ["pydantic-ai-slim>=1.60"]
+agent-framework = ["agent-framework-core>=1.26"]
 all = [
     "marshal-ai[config,opentelemetry,openai,anthropic,google-genai,mcp,chroma,langchain,claude-agent-sdk,adk,openai-agents,litellm]",
-    "marshal-ai[mongodb,firestore,pgvector,qdrant,pinecone,elasticsearch,weaviate,lancedb,a2a,pydantic-ai]",
+    "marshal-ai[mongodb,firestore,pgvector,qdrant,pinecone,elasticsearch,weaviate,lancedb,a2a,pydantic-ai,agent-framework]",
 ]
 dev = [
     "marshal-ai[all]",

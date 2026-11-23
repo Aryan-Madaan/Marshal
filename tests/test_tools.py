@@ -492,3 +492,90 @@ def test_authorize_without_a_tool_and_tool_name_required():
         guard.call(Principal(id="a"), {})
     with pytest.raises(ValueError):
         ToolGuard()
+
+
+# --- v0.15: tool outcomes, circuit breaker, failed-call trigger ----------------
+
+from marshal_ai import ToolCircuitBreakerPolicy, ToolOutcomeEntry  # noqa: E402
+
+
+def _flaky(fail_times):
+    state = {"n": 0}
+
+    def tool(**kwargs):
+        state["n"] += 1
+        if state["n"] <= fail_times:
+            raise ConnectionError("upstream reset: token=abc123")
+        return "ok"
+
+    return tool, state
+
+
+def test_outcomes_are_audited_when_opted_in_and_never_include_the_message():
+    sink = InMemoryAuditSink()
+    tool, _ = _flaky(1)
+    guard = ToolGuard(tool=tool, audit_sink=sink, tool_name="sync", audit_outcomes=True)
+    with pytest.raises(ConnectionError):
+        guard.call(Principal(id="a"), {})
+    assert guard.call(Principal(id="a"), {}) == "ok"
+    outcomes = [e for e in sink.all_entries() if isinstance(e, ToolOutcomeEntry)]
+    assert [(o.success, o.error) for o in outcomes] == [(False, "ConnectionError"), (True, None)]
+    assert "abc123" not in str([o.to_dict() for o in outcomes])
+
+
+def test_outcome_auditing_is_off_by_default():
+    sink = InMemoryAuditSink()
+    ToolGuard(tool=lambda: 1, audit_sink=sink, tool_name="t").call(Principal(id="a"), {})
+    assert [e.to_dict()["kind"] for e in sink.all_entries()] == ["tool_call"]
+
+
+def test_tool_circuit_breaker_opens_on_failures_and_self_heals():
+    import time as _time
+
+    policy = ToolCircuitBreakerPolicy(RiskTierPolicy({"low": "allow"}), failure_threshold=2, window_seconds=0.3)
+    tool, state = _flaky(2)
+    guard = ToolGuard(tool=tool, policy=policy, tool_name="search")
+    for _ in range(2):
+        with pytest.raises(ConnectionError):
+            guard.call(Principal(id="a"), {})
+    with pytest.raises(ToolCallDenied, match="circuit breaker open"):
+        guard.call(Principal(id="b"), {})  # every principal: the *tool* is broken
+    assert state["n"] == 2  # the open breaker never called it
+    _time.sleep(0.35)
+    assert guard.call(Principal(id="a"), {}) == "ok"
+
+
+def test_runaway_failed_call_trigger_trips_the_principal_until_reset():
+    policy = RunawayAgentPolicy(RiskTierPolicy({"low": "allow"}), identical_call_threshold=100,
+                                window_seconds=60, failed_call_threshold=3)
+    tool, _ = _flaky(10)
+    guard = ToolGuard(tool=tool, policy=policy, tool_name="parse")
+    for i in range(3):
+        with pytest.raises(ConnectionError):
+            guard.call(Principal(id="a"), {"attempt": i})  # different args each time
+    with pytest.raises(ToolCallDenied, match="runaway"):
+        guard.call(Principal(id="a"), {"attempt": 99})
+    assert guard.call is not None and not policy.is_tripped("b")
+    policy.reset("a")
+    assert not policy.is_tripped("a")
+
+
+def test_denials_are_never_counted_as_failures():
+    breaker = ToolCircuitBreakerPolicy(RiskTierPolicy({"high": "deny"}), failure_threshold=1, window_seconds=60)
+    guard = ToolGuard(tool=lambda: 1, policy=breaker, tool_name="t")
+    for _ in range(3):
+        with pytest.raises(ToolCallDenied):
+            guard.call(Principal(id="a"), {}, risk_tier="high")
+    assert breaker.recent_failure_count("t") == 0
+
+
+def test_outcomes_pass_through_every_wrapper_to_the_breaker():
+    from marshal_ai import EgressAllowlist, EgressPolicy, FlowTracker, LethalTrifectaPolicy, SensitiveDataToolPolicy
+
+    breaker = ToolCircuitBreakerPolicy(RiskTierPolicy({"low": "allow"}), failure_threshold=1, window_seconds=60)
+    stacked = EgressPolicy(LethalTrifectaPolicy(SensitiveDataToolPolicy(RedactingToolPolicy(breaker, [])), FlowTracker()),
+                           EgressAllowlist(["example.com"]))
+    tool, _ = _flaky(1)
+    with pytest.raises(ConnectionError):
+        ToolGuard(tool=tool, policy=stacked, tool_name="t").call(Principal(id="a"), {})
+    assert breaker.recent_failure_count("t") == 1

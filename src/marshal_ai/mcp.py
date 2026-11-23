@@ -121,7 +121,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
 
 from marshal_ai.audit import AuditSink, InMemoryAuditSink, register_entry_type
 from marshal_ai.policy import GuardMode, Principal
@@ -137,6 +137,8 @@ from marshal_ai.tools import (
 
 if TYPE_CHECKING:
     from mcp.types import CallToolResult, ListToolsResult
+
+    from marshal_ai.flow import FlowTracker
 
 
 # The fields a model actually reads about a tool. `meta`/`icons`/
@@ -243,8 +245,13 @@ class MCPToolPins:
             self._save_locked()
 
     def check(self, server_id: str, tool: Any) -> PinCheck:
-        name = _tool_field(tool, "name")
-        actual = tool_fingerprint(tool)
+        return self.check_fingerprint(server_id, _tool_field(tool, "name"), tool_fingerprint(tool))
+
+    def check_fingerprint(self, server_id: str, name: str, actual: str) -> PinCheck:
+        """Pin check for any reviewed definition, not just MCP tools — e.g.
+        an A2A agent card (`marshal_ai.integrations.a2a`). Same rules as
+        `check`. Use a separate `MCPToolPins` (its own file) per kind of
+        definition, so names from one can't look like shadowing in another."""
         with self._lock:
             expected = self._pins.get(server_id, {}).get(name)
             if expected is None:
@@ -349,6 +356,19 @@ class GovernedMCPSession:
     `mcp_annotations` (when the tool has been listed), so policies such as
     `marshal_ai.flow.LethalTrifectaPolicy` can use them.
 
+    Outcomes: every call that runs is reported to the policy's
+    `record_outcome` — a raised exception, or a result with `is_error`
+    set, is a failure — so `ToolCircuitBreakerPolicy` and
+    `RunawayAgentPolicy(failed_call_threshold=...)` see a broken server.
+    `audit_outcomes=True` also writes a `ToolOutcomeEntry` per call.
+
+    Resources: with a `flow_tracker`, `read_resource(uri)` labels the
+    session — `default_resource_labels` (`{"untrusted_content"}`: text an
+    MCP server hands back is attacker-writable unless you know otherwise),
+    or the labels of the longest matching prefix in `resource_labels`
+    (e.g. `{"crm://": {"private_data"}}`). The flow-label entry names the
+    server, never the URI, which can itself carry sensitive identifiers.
+
     `list_tools()` is governed only when `tool_pins` is given (see the
     module docstring): tools whose definitions fail the pin check are
     removed from the listing, so the model never reads a changed
@@ -375,6 +395,10 @@ class GovernedMCPSession:
         server_id: str = "mcp",
         tool_pins: Optional[MCPToolPins] = None,
         mode: GuardMode = "enforce",
+        audit_outcomes: bool = False,
+        flow_tracker: Optional["FlowTracker"] = None,
+        resource_labels: Optional[dict[str, Iterable[str]]] = None,
+        default_resource_labels: Iterable[str] = ("untrusted_content",),
     ) -> None:
         self._session = session
         self._principal = principal
@@ -390,6 +414,15 @@ class GovernedMCPSession:
         self._server_id = server_id
         self._tool_pins = tool_pins
         self._mode = mode
+        self._audit_outcomes = audit_outcomes
+        self._flow_tracker = flow_tracker
+        # Longest prefix wins, so "file:///public/" can override "file:///".
+        self._resource_labels = sorted(
+            ((prefix, frozenset(labels)) for prefix, labels in (resource_labels or {}).items()),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+        self._default_resource_labels = frozenset(default_resource_labels)
         # tool name -> PinCheck from the most recent listing, and
         # annotations for context. Only meaningful when tool_pins is set.
         self._checks: dict[str, PinCheck] = {}
@@ -520,6 +553,35 @@ class GovernedMCPSession:
             tool_name=name,
             mode=self._mode,
             mcp_server=self._server_id,
+            audit_outcomes=self._audit_outcomes,
         )
         guard.authorize(self._principal, arguments, risk_tier=tier, context=call_context)
-        return await self._session.call_tool(name, arguments, *args, **kwargs)
+        start = time.monotonic()
+        try:
+            result = await self._session.call_tool(name, arguments, *args, **kwargs)
+        except Exception as exc:
+            guard.record_outcome(
+                self._principal, arguments, False, (time.monotonic() - start) * 1000,
+                type(exc).__name__, tier, call_context,
+            )
+            raise
+        failed = bool(getattr(result, "is_error", False))
+        guard.record_outcome(
+            self._principal, arguments, not failed, (time.monotonic() - start) * 1000,
+            "tool_error" if failed else None, tier, call_context,
+        )
+        return result
+
+    async def read_resource(self, uri: Any, *args: Any, **kwargs: Any) -> Any:
+        """Forward to the client's `read_resource`, first labeling the
+        session in `flow_tracker` (if one was given) — see the class
+        docstring."""
+        if self._flow_tracker is not None:
+            text = str(uri)
+            labels = next(
+                (labels for prefix, labels in self._resource_labels if text.startswith(prefix)),
+                self._default_resource_labels,
+            )
+            if labels:
+                self._flow_tracker.add(self._principal, labels, f"mcp_resource:{self._server_id}")
+        return await self._session.read_resource(uri, *args, **kwargs)

@@ -17,6 +17,7 @@ run instead. Verified against pydantic-ai-slim 1.60
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -44,4 +45,11 @@ class MarshalToolset(WrapperToolset):
             if self.on_deny == "raise":
                 raise ToolCallDenied(name, result.reason)
             return f"Tool call blocked by policy: {result.reason}"
-        return await super().call_tool(name, tool_args, ctx, tool)
+        start = time.monotonic()
+        try:
+            output = await super().call_tool(name, tool_args, ctx, tool)
+        except Exception as exc:
+            self.governor.record_outcome(name, tool_args, False, (time.monotonic() - start) * 1000, type(exc).__name__)
+            raise
+        self.governor.record_outcome(name, tool_args, True, (time.monotonic() - start) * 1000)
+        return output

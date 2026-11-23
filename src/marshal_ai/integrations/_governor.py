@@ -19,7 +19,15 @@ from typing import Any, Callable, Optional, Union
 
 from marshal_ai.audit import AuditSink, InMemoryAuditSink
 from marshal_ai.policy import GuardMode, Principal
-from marshal_ai.tools import ApprovalHandler, CLIApprovalHandler, ToolCallDenied, ToolGuard, ToolPolicy
+from marshal_ai.tools import (
+    ApprovalDeferredToHost,
+    ApprovalHandler,
+    CLIApprovalHandler,
+    ToolCallDenied,
+    ToolDecision,
+    ToolGuard,
+    ToolPolicy,
+)
 
 PrincipalSource = Union[Principal, Callable[[], Principal]]
 
@@ -28,6 +36,17 @@ PrincipalSource = Union[Principal, Callable[[], Principal]]
 class GovernorResult:
     allowed: bool
     reason: str
+    # True when the decision was handed to the host's own prompt
+    # (`DeferToHostApprovalHandler`), rather than denied.
+    deferred: bool = False
+
+
+class _ForcedDeny(ToolPolicy):
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def evaluate(self, request: Any) -> ToolDecision:
+        return ToolDecision("deny", self._reason)
 
 
 class ToolGovernor:
@@ -46,6 +65,7 @@ class ToolGovernor:
         audit_sink: Optional[AuditSink] = None,
         approval_handler: Optional[ApprovalHandler] = None,
         mode: GuardMode = "enforce",
+        audit_outcomes: bool = False,
     ) -> None:
         self.policy = policy
         self._principal = principal
@@ -54,6 +74,54 @@ class ToolGovernor:
         self.audit_sink = audit_sink if audit_sink is not None else InMemoryAuditSink()
         self.approval_handler = approval_handler if approval_handler is not None else CLIApprovalHandler()
         self.mode = mode
+        self.audit_outcomes = audit_outcomes
+
+    def _guard(
+        self, tool_name: str, mcp_server: Optional[str], policy: Any = None,
+        approval_handler: Optional[ApprovalHandler] = None,
+    ) -> ToolGuard:
+        return ToolGuard(
+            policy=policy if policy is not None else self.policy,
+            audit_sink=self.audit_sink,
+            approval_handler=approval_handler if approval_handler is not None else self.approval_handler,
+            tool_name=tool_name,
+            mode=self.mode,
+            mcp_server=mcp_server,
+            audit_outcomes=self.audit_outcomes,
+        )
+
+    def _tier(self, tool_name: str, tier_aliases: tuple[str, ...]) -> str:
+        # `tier_aliases` (e.g. the full "mcp__crm__delete_account" form)
+        # are looked up first, then the bare name, then the default.
+        return next(
+            (self.risk_tiers[key] for key in (*tier_aliases, tool_name) if key in self.risk_tiers),
+            self.default_risk_tier,
+        )
+
+    def record_outcome(
+        self,
+        tool_name: str,
+        arguments: Any,
+        success: bool,
+        latency_ms: Optional[float] = None,
+        error: Optional[str] = None,
+        principal: Optional[Principal] = None,
+        mcp_server: Optional[str] = None,
+        tier_aliases: tuple[str, ...] = (),
+    ) -> None:
+        """Report what happened to a call `check()` allowed, so
+        reliability policies (`ToolCircuitBreakerPolicy`,
+        `RunawayAgentPolicy(failed_call_threshold=...)`) see it. Never
+        raises: a reporting problem must not turn a successful tool call
+        into a failed one."""
+        try:
+            resolved = self.resolve_principal(principal)
+            args = arguments if isinstance(arguments, dict) else {}
+            self._guard(tool_name, mcp_server).record_outcome(
+                resolved, args, success, latency_ms, error, self._tier(tool_name, tier_aliases)
+            )
+        except Exception:
+            pass
 
     def resolve_principal(self, override: Optional[Principal] = None) -> Principal:
         if override is not None:
@@ -72,6 +140,8 @@ class ToolGovernor:
         context: Optional[dict[str, Any]] = None,
         mcp_server: Optional[str] = None,
         tier_aliases: tuple[str, ...] = (),
+        approval_handler: Optional[ApprovalHandler] = None,
+        policy_override_reason: Optional[str] = None,
     ) -> GovernorResult:
         """Authorize one tool call. Never raises for a governance
         decision: returns `allowed=False` with the reason instead. A
@@ -85,7 +155,7 @@ class ToolGovernor:
             arguments = {"_raw": repr(arguments)[:200]}
             forced_deny = reason
         else:
-            forced_deny = None
+            forced_deny = policy_override_reason
         try:
             resolved = self.resolve_principal(principal)
         except Exception as exc:
@@ -93,29 +163,18 @@ class ToolGovernor:
 
         policy = self.policy
         if forced_deny is not None:
-            from marshal_ai.tools import RiskTierPolicy
-
-            policy = RiskTierPolicy({}, default="deny")
-        guard = ToolGuard(
-            policy=policy,
-            audit_sink=self.audit_sink,
-            approval_handler=self.approval_handler,
-            tool_name=tool_name,
-            mode=self.mode,
-            mcp_server=mcp_server,
-        )
-        # `tier_aliases` (e.g. the full "mcp__crm__delete_account" form)
-        # are looked up first, then the bare name, then the default.
-        tier = next(
-            (self.risk_tiers[key] for key in (*tier_aliases, tool_name) if key in self.risk_tiers),
-            self.default_risk_tier,
-        )
+            # Audited through the ordinary deny path, with the real reason.
+            policy = _ForcedDeny(forced_deny)
+        guard = self._guard(tool_name, mcp_server, policy, approval_handler)
+        tier = self._tier(tool_name, tier_aliases)
         try:
             evaluated = copy.deepcopy(arguments)
         except Exception:
             evaluated = dict(arguments)
         try:
             decision = guard.authorize(resolved, evaluated, risk_tier=tier, context=context)
+        except ApprovalDeferredToHost as exc:
+            return GovernorResult(False, exc.reason, deferred=True)
         except ToolCallDenied as exc:
             return GovernorResult(False, forced_deny or exc.reason)
         return GovernorResult(True, decision.reason)

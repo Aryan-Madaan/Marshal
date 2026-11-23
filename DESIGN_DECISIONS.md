@@ -1051,6 +1051,31 @@ environment silently downgraded mcp to 1.23. So the adapter is
 dependency-free (a plain hook function), imports CrewAI only inside
 `enable_crewai`, and is tested in its own CI job.
 
+## Tool outcomes: always reported to policies, audited only on request
+
+**Decision point — two separate switches.** Reliability policies need
+every outcome to work at all, so `ToolGuard` always feeds
+`ToolPolicy.record_outcome`. Writing a `ToolOutcomeEntry` per call is a
+different decision: it doubles audit volume and changes the trail's shape
+for existing consumers (16 existing tests read "the last entry is the
+tool call"). So it's `audit_outcomes=True`, off by default.
+
+**Decision point — forward by default through `_base`.** Every tool
+wrapper already keeps its wrapped policy in `_base`. The base-class
+`record_outcome` forwards there, so outcomes reach a breaker at the
+bottom of any stack, including wrappers written before outcomes existed,
+without each one opting in.
+
+**Decision point — record the exception type, never the message.**
+Exception messages routinely echo arguments (URLs with tokens, account
+ids). The type is enough to tell a timeout from a validation error.
+
+**Decision point — "deferred to host" is not "approved".** When the
+Claude Agent SDK's own prompt takes the approval, Marshal never sees the
+answer. Recording "approved" would claim something Marshal didn't
+observe, so the outcome is `deferred_to_host`, and whether the tool then
+ran shows up as an outcome entry.
+
 ## Design patterns already in use (kept, not re-invented)
 
 - **Self-registering discriminator** (`register_entry_type`) for the

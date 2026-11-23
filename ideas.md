@@ -584,6 +584,21 @@ piece of that story, not this one.
   applied; google-adk still requires google-genai<3, so the genai floor
   stays on 2.x (tested on both).
 
+- **v0.15 — tools learn whether they worked.** `ToolPolicy.record_outcome`
+  (forwarded automatically by every wrapper), reported by `ToolGuard.call`,
+  `GovernedMCPSession` (`is_error` counts as failure), and every framework
+  hook (Claude's `PostToolUse`/`PostToolUseFailure` with the SDK's own
+  duration). That unlocked the long-deferred
+  `RunawayAgentPolicy(failed_call_threshold=...)` and a new
+  `ToolCircuitBreakerPolicy`. `ToolOutcomeEntry` is opt-in
+  (`audit_outcomes=True`): turning it on by default changed the shape of
+  every existing audit trail, which 16 existing tests caught. Also:
+  `read_resource` labels the session for the trifecta gate, A2A
+  agent-card pinning (`MCPToolPins.check_fingerprint`), the Claude Agent
+  SDK "ask" route (`DeferToHostApprovalHandler`, audited as
+  `deferred_to_host`), and Microsoft Agent Framework function middleware.
+  **Found along the way**: forced denials (malformed arguments) were
+  audited with a generic default-deny reason instead of the real one.
 - **v0.14 — connectors, a durable approval queue, model-side loop
   protection, and three more frameworks.**
   - **`marshal_ai.connectors`** (closes "vector-store adapters beyond
@@ -658,29 +673,6 @@ keeping each surface's scope maximally narrow.
   spreadsheets, normalized into retrieval-ready chunks with real provenance
   metadata — the kind of long-tail, mixed-format source mix a real
   enterprise retrieval system ends up needing to ingest.
-
-- **`RunawayAgentPolicy`'s N-failed-calls trigger.** v0.9 shipped the
-  identical-call trigger only (see Shipped below) — a parallel "N *failed*
-  calls from one principal" trigger was considered too, but it needs
-  `ToolGuard` to report call outcomes the way `ModelGuard.record_outcome`
-  does for model calls, and that plumbing doesn't exist for tool calls
-  yet (today, if the wrapped tool itself raises inside `ToolGuard.call()`,
-  the exception just propagates — nothing observes or audits it, the same
-  shape of gap `ModelGuard` had before v0.8). Worth its own pass: adding
-  `ToolPolicy.record_outcome` and wiring `ToolGuard.call()` to report
-  success/failure around the actual `self._tool(**arguments)` invocation
-  is a real, separate piece of work, not a one-line addition to
-  `RunawayAgentPolicy`.
-
-- **Framework hooks still missing.** Microsoft Agent Framework middleware
-  (its middleware layer details weren't verifiable when v0.14 shipped),
-  and the Claude Agent SDK's `permissionDecision: "ask"` as an approval
-  route (needs an honest "deferred to the host" audit outcome).
-
-- **Agent Card pinning for A2A.** `MCPToolPins` catches an MCP server
-  rewriting a tool's description; the A2A equivalent is a remote agent's
-  card (skills, interfaces) changing after review. A2A 1.0 also defines
-  signed Agent Cards (JWS), which could be verified instead of trusted.
 
 - **Audit sinks on the connector backends.** Connectors cover retrieval
   over MongoDB/Firestore/Postgres; durable `AuditSink`s there (with the

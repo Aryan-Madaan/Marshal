@@ -44,6 +44,24 @@ wheels = [
 ]
 
 [[package]]
+name = "agent-framework-core"
+version = "1.26.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "msgspec" },
+    { name = "opentelemetry-api" },
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+    { name = "regex" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5f/b0/632e1bd56c8d6202b146d81767ef3dc5dff0e25a05442aa0c571ac973612/agent_framework_core-1.26.0.tar.gz", hash = "sha256:7ecd792184c8e706220ea3994fba71aa422a3e8be396a510ec2c4dd014289bca", size = 827413, upload-time = "2026-11-12T18:25:08.694Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/2a/5cc1d3b5274489355e57e273df3c5e330613a0b3e5498bd2bf6265500ed5/agent_framework_core-1.26.0-py3-none-any.whl", hash = "sha256:175b75f07e15d1bb7b6cea9cb35b965ac2528cd96e3eae8f791c85c48c7232b3", size = 889044, upload-time = "2026-11-12T18:25:48.022Z" },
+]
+
+[[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2250,7 +2268,7 @@ wheels = [
 
 [[package]]
 name = "marshal-ai"
-version = "0.14.0"
+version = "0.15.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -2260,8 +2278,12 @@ a2a = [
 adk = [
     { name = "google-adk" },
 ]
+agent-framework = [
+    { name = "agent-framework-core" },
+]
 all = [
     { name = "a2a-sdk" },
+    { name = "agent-framework-core" },
     { name = "anthropic" },
     { name = "chromadb", marker = "python_full_version < '3.14' or python_full_version == '3.14.*' and (platform_machine != 'x86_64' or sys_platform != 'darwin')" },
     { name = "claude-agent-sdk" },
@@ -2301,6 +2323,7 @@ config = [
 ]
 dev = [
     { name = "a2a-sdk" },
+    { name = "agent-framework-core" },
     { name = "anthropic" },
     { name = "chromadb", marker = "python_full_version < '3.14' or python_full_version == '3.14.*' and (platform_machine != 'x86_64' or sys_platform != 'darwin')" },
     { name = "claude-agent-sdk" },
@@ -2383,6 +2406,7 @@ weaviate = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", marker = "extra == 'a2a'", specifier = ">=1.3" },
+    { name = "agent-framework-core", marker = "extra == 'agent-framework'", specifier = ">=1.26" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=2.12" },
     { name = "chromadb", marker = "python_full_version == '3.14.*' and ((platform_machine != 'x86_64' and extra == 'chroma') or (sys_platform != 'darwin' and extra == 'chroma')) or python_full_version < '3.14' and extra == 'chroma'", specifier = ">=1.5.9" },
     { name = "claude-agent-sdk", marker = "extra == 'claude-agent-sdk'", specifier = ">=0.2.187" },
@@ -2397,7 +2421,7 @@ requires-dist = [
     { name = "litellm", marker = "extra == 'litellm'", specifier = "!=1.82.7,!=1.82.8,>=1.110" },
     { name = "marshal-ai", extras = ["all"], marker = "extra == 'dev'" },
     { name = "marshal-ai", extras = ["config", "opentelemetry", "openai", "anthropic", "google-genai", "mcp", "chroma", "langchain", "claude-agent-sdk", "adk", "openai-agents", "litellm"], marker = "extra == 'all'" },
-    { name = "marshal-ai", extras = ["mongodb", "firestore", "pgvector", "qdrant", "pinecone", "elasticsearch", "weaviate", "lancedb", "a2a", "pydantic-ai"], marker = "extra == 'all'" },
+    { name = "marshal-ai", extras = ["mongodb", "firestore", "pgvector", "qdrant", "pinecone", "elasticsearch", "weaviate", "lancedb", "a2a", "pydantic-ai", "agent-framework"], marker = "extra == 'all'" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3" },
     { name = "numpy", marker = "extra == 'dev'", specifier = ">=2.3" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=3.57" },
@@ -2413,7 +2437,7 @@ requires-dist = [
     { name = "qdrant-client", marker = "extra == 'qdrant'", specifier = ">=1.20" },
     { name = "weaviate-client", marker = "python_full_version < '3.15' and extra == 'weaviate'", specifier = ">=4.24" },
 ]
-provides-extras = ["config", "opentelemetry", "openai", "anthropic", "google-genai", "mcp", "chroma", "langchain", "claude-agent-sdk", "adk", "openai-agents", "litellm", "mongodb", "firestore", "pgvector", "qdrant", "pinecone", "elasticsearch", "weaviate", "lancedb", "a2a", "pydantic-ai", "all", "dev"]
+provides-extras = ["config", "opentelemetry", "openai", "anthropic", "google-genai", "mcp", "chroma", "langchain", "claude-agent-sdk", "adk", "openai-agents", "litellm", "mongodb", "firestore", "pgvector", "qdrant", "pinecone", "elasticsearch", "weaviate", "lancedb", "a2a", "pydantic-ai", "agent-framework", "all", "dev"]
 
 [[package]]
 name = "mcp"

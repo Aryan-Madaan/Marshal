@@ -20,6 +20,7 @@ Requires `langchain>=1.0` (the `[langchain]` extra).
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Literal, Optional
 
 from langchain.agents.middleware import AgentMiddleware
@@ -64,14 +65,36 @@ class MarshalToolMiddleware(AgentMiddleware):
             status="error",
         )
 
+    def _report(self, request: Any, call: dict, start: float, output: Any, exc: Optional[BaseException]) -> None:
+        failed = exc is not None or getattr(output, "status", None) == "error"
+        error = type(exc).__name__ if exc is not None else ("tool_error" if failed else None)
+        principal = self._principal_from_request(request) if self._principal_from_request else None
+        self._governor.record_outcome(
+            call["name"], call.get("args", {}), not failed, (time.monotonic() - start) * 1000, error, principal
+        )
+
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         result, call = self._check(request)
         if not result.allowed:
             return self._refusal(result, call)
-        return handler(request)
+        start = time.monotonic()
+        try:
+            output = handler(request)
+        except Exception as exc:
+            self._report(request, call, start, None, exc)
+            raise
+        self._report(request, call, start, output, None)
+        return output
 
     async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         result, call = self._check(request)
         if not result.allowed:
             return self._refusal(result, call)
-        return await handler(request)
+        start = time.monotonic()
+        try:
+            output = await handler(request)
+        except Exception as exc:
+            self._report(request, call, start, None, exc)
+            raise
+        self._report(request, call, start, output, None)
+        return output

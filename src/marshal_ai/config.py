@@ -90,7 +90,10 @@ tool_policy (`marshal_ai.tools`):
   - `rate_limit` (wrapper) -> `RateLimitPolicy`: `max_calls` (int),
     `window_seconds` (number).
   - `runaway_agent` (wrapper) -> `RunawayAgentPolicy`:
-    `identical_call_threshold` (int), `window_seconds` (number).
+    `identical_call_threshold` (int), `window_seconds` (number),
+    `failed_call_threshold` (optional int).
+  - `circuit_breaker` (wrapper) -> `ToolCircuitBreakerPolicy`:
+    `failure_threshold` (int), `window_seconds` (number).
   - `jurisdictional_risk_tier` (wrapper) -> `JurisdictionalRiskTierPolicy`:
     `overrides_by_jurisdiction` (dict[str, dict[str, str]]).
   - `sensitive_data` (wrapper) -> `SensitiveDataToolPolicy`:
@@ -216,6 +219,7 @@ from marshal_ai.tools import (
     RedactingToolPolicy,
     RiskTierPolicy,
     RunawayAgentPolicy,
+    ToolCircuitBreakerPolicy,
     ToolPolicy,
 )
 
@@ -429,8 +433,20 @@ def _build_rate_limit_policy(params: dict[str, Any], base: ToolPolicy) -> ToolPo
 def _build_runaway_agent_policy(params: dict[str, Any], base: ToolPolicy) -> ToolPolicy:
     threshold = _as_int(_require(params, "identical_call_threshold"), "'identical_call_threshold'")
     window_seconds = _as_number(_require(params, "window_seconds"), "'window_seconds'")
+    failed = params.pop("failed_call_threshold", None)
+    if failed is not None:
+        failed = _as_int(failed, "'failed_call_threshold'")
     _reject_unknown(params)
-    return RunawayAgentPolicy(base=base, identical_call_threshold=threshold, window_seconds=window_seconds)
+    return RunawayAgentPolicy(
+        base=base, identical_call_threshold=threshold, window_seconds=window_seconds, failed_call_threshold=failed
+    )
+
+
+def _build_tool_circuit_breaker_policy(params: dict[str, Any], base: ToolPolicy) -> ToolPolicy:
+    failure_threshold = _as_int(_require(params, "failure_threshold"), "'failure_threshold'")
+    window_seconds = _as_number(_require(params, "window_seconds"), "'window_seconds'")
+    _reject_unknown(params)
+    return ToolCircuitBreakerPolicy(base, failure_threshold=failure_threshold, window_seconds=window_seconds)
 
 
 def _build_jurisdictional_risk_tier_policy(params: dict[str, Any], base: ToolPolicy) -> ToolPolicy:
@@ -588,6 +604,7 @@ register_builder("tool", "runaway_agent", "wrapper", _build_runaway_agent_policy
 register_builder("tool", "jurisdictional_risk_tier", "wrapper", _build_jurisdictional_risk_tier_policy)
 register_builder("tool", "sensitive_data", "wrapper", _build_sensitive_data_tool_policy)
 register_builder("tool", "egress", "wrapper", _build_egress_policy)
+register_builder("tool", "circuit_breaker", "wrapper", _build_tool_circuit_breaker_policy)
 
 register_builder("model", "allowlist", "base", _build_allowlist_model_policy)
 register_builder("model", "allow_all", "base", _build_allow_all_models)

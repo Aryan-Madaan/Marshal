@@ -600,3 +600,14 @@ def test_model_rate_limit_runaway_and_budget_estimates_load_from_config():
     with pytest.raises(PolicyConfigError, match="enforce_estimates"):
         load_policies({"model_policy": {"base": {"type": "allow_all"}, "wrappers": [
             {"type": "budget", "pricing": {}, "limit_usd": 1, "enforce_estimates": "yes"}]}})
+
+
+def test_tool_circuit_breaker_and_failed_call_threshold_load_from_config():
+    from marshal_ai import RunawayAgentPolicy, ToolCircuitBreakerPolicy
+
+    loaded = load_policies({"tool_policy": {"base": {"type": "allow_all"}, "wrappers": [
+        {"type": "circuit_breaker", "failure_threshold": 5, "window_seconds": 60},
+        {"type": "runaway_agent", "identical_call_threshold": 10, "window_seconds": 60, "failed_call_threshold": 5},
+    ]}})
+    assert isinstance(loaded.tool_policy, RunawayAgentPolicy)
+    assert isinstance(loaded.tool_policy._base, ToolCircuitBreakerPolicy)

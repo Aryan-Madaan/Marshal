@@ -44,3 +44,17 @@ class MarshalPlugin(BasePlugin):
         if result.allowed:
             return None
         return {"error": f"Tool call blocked by policy: {result.reason}"}
+
+    async def after_tool_callback(
+        self, *, tool: Any, tool_args: dict[str, Any], tool_context: Any, result: dict[str, Any]
+    ) -> Optional[dict]:
+        self._governor.record_outcome(getattr(tool, "name", type(tool).__name__), tool_args, True)
+        return None
+
+    async def on_tool_error_callback(
+        self, *, tool: Any, tool_args: dict[str, Any], tool_context: Any, error: Exception
+    ) -> Optional[dict]:
+        self._governor.record_outcome(
+            getattr(tool, "name", type(tool).__name__), tool_args, False, error=type(error).__name__
+        )
+        return None  # let ADK's own error handling proceed

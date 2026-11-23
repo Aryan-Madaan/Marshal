@@ -344,7 +344,7 @@ _GRANULARITY_FORMATS = {
 # did not run) is an approval-flow outcome for the same reason.
 _ALLOWED_OUTCOMES = {"allow", "approved"}
 _DENIED_OUTCOMES = {"deny", "declined"}
-_APPROVAL_OUTCOMES = {"approved", "declined", "require_approval", "pending_approval"}
+_APPROVAL_OUTCOMES = {"approved", "declined", "require_approval", "pending_approval", "deferred_to_host"}
 
 
 @dataclass(frozen=True)

@@ -172,6 +172,21 @@ New in v0.14:
 - **More frameworks**: A2A (agent-to-agent calls), Pydantic AI, and
   CrewAI.
 
+New in v0.15:
+
+- **Tool reliability.** `ToolGuard` now learns whether each call worked.
+  `ToolCircuitBreakerPolicy` stops calling a tool that keeps failing, and
+  `RunawayAgentPolicy(failed_call_threshold=...)` stops an agent whose
+  calls keep failing. MCP `is_error` results count as failures, and every
+  framework hook reports outcomes.
+- **MCP resources join the trifecta gate.** `read_resource` labels the
+  session (untrusted by default).
+- **A2A agent-card pinning.** A remote agent whose card changes after
+  review is refused.
+- **Claude Agent SDK `ask`.** Approvals can be handed to the SDK's own
+  prompt, audited as `deferred_to_host`, never as "approved".
+- **Microsoft Agent Framework** function middleware.
+
 See [`ideas.md`](./ideas.md) for what's next.
 
 ## Install
@@ -441,6 +456,26 @@ but healthy agent can be just as fast), and *does this jurisdiction demand
 more oversight* (jurisdictional risk tiering — monotonic, can only add
 approval requirements, never remove one the base policy already set).
 Run `python examples/agent_reliability_example.py` for all three together.
+
+## Quickstart: when tools break
+
+```python
+from marshal_ai import RiskTierPolicy, RunawayAgentPolicy, ToolCircuitBreakerPolicy, ToolGuard
+
+policy = RunawayAgentPolicy(
+    ToolCircuitBreakerPolicy(RiskTierPolicy({"low": "allow"}), failure_threshold=5, window_seconds=60),
+    identical_call_threshold=20, window_seconds=60, failed_call_threshold=10,
+)
+guard = ToolGuard(tool=search_orders, policy=policy, audit_outcomes=True)
+```
+
+Every call that actually runs is reported (success, latency, exception
+*type*, never its message) to the policy. The circuit breaker protects
+callers from a broken *tool* and heals itself once failures age out. The
+failed-call trigger stops a broken *agent* until a human `reset()`s it.
+A denial never counts as a failure. `audit_outcomes=True` also writes a
+`ToolOutcomeEntry` per call. It's off by default so existing audit
+trails keep their shape. Run `python examples/tool_reliability_example.py`.
 
 ## Quickstart: model-call loops and budgets
 
@@ -741,6 +776,10 @@ agent = Agent(model, toolsets=[MarshalToolset(toolset, governor)])
 # CrewAI (every tool call in every crew)
 from marshal_ai.integrations.crewai import enable_crewai
 enable_crewai(governor)
+
+# Microsoft Agent Framework (function middleware)
+from marshal_ai.integrations.agent_framework import MarshalFunctionMiddleware
+agent = ChatAgent(chat_client=client, tools=tools, middleware=[MarshalFunctionMiddleware(governor)])
 
 # A2A: what your agent sends to *other* agents
 from marshal_ai.integrations.a2a import MarshalA2AInterceptor
@@ -1164,20 +1203,22 @@ your tracing backend, not in this process).
 
 ## Status
 
-v0.14. Governs all three surfaces (retrieval; tool calls; model calls)
+v0.15. Governs all three surfaces (retrieval; tool calls; model calls)
 with one shared, tamper-evident audit trail:
 
 - **Retrieval:** connectors for eight vector stores with in-database
   policy pushdown, and delegation (an agent acting for a user).
 - **Tool calls:** risk tiers, rate limits, runaway loops, jurisdiction,
   lethal-trifecta flow control, egress allowlisting, MCP with
-  tool-definition pinning, A2A, and a durable approval queue.
+  tool-definition pinning, A2A with agent-card pinning, a durable
+  approval queue, and outcome-driven circuit breaking.
 - **Model calls:** routing, budgets (including pre-call estimates), data
   residency, retention, circuit breaking, rate limits and runaway-loop
   detection, plus refusal of provider-hosted tools. Every OpenAI,
   Anthropic and Gemini SDK entry point is governed.
 - **Frameworks:** native hooks for LangChain, the Claude Agent SDK, ADK,
-  the OpenAI Agents SDK, Pydantic AI, CrewAI and the LiteLLM proxy.
+  the OpenAI Agents SDK, Pydantic AI, Microsoft Agent Framework, CrewAI
+  and the LiteLLM proxy.
 - **Everything else:** shadow mode, policy-as-config, sensitive-data
   detection, OpenTelemetry export, and EU AI Act-shaped activity,
   cross-border and Article 73 incident reports.

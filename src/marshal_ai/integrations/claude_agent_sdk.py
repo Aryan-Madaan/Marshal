@@ -28,6 +28,7 @@ from typing import Any, Optional
 from claude_agent_sdk import HookMatcher
 
 from marshal_ai.integrations._governor import ToolGovernor
+from marshal_ai.tools import DeferToHostApprovalHandler
 
 
 def _split_mcp_name(tool_name: str) -> tuple[Optional[str], str]:
@@ -38,8 +39,15 @@ def _split_mcp_name(tool_name: str) -> tuple[Optional[str], str]:
     return None, tool_name
 
 
-def pre_tool_use_hook(governor: ToolGovernor):
-    """The raw hook callback, for composing into your own `HookMatcher`."""
+def pre_tool_use_hook(governor: ToolGovernor, ask_for_approval: bool = False):
+    """The raw hook callback, for composing into your own `HookMatcher`.
+
+    `ask_for_approval=True` hands `require_approval` decisions to the
+    SDK's own permission prompt (`permissionDecision: "ask"`) instead of
+    the governor's approval handler — the user approves in the host app.
+    Audited as `deferred_to_host`, never as "approved": Marshal doesn't
+    see the answer. Denials are still denials."""
+    deferral = DeferToHostApprovalHandler() if ask_for_approval else None
 
     async def hook(input_data: Any, tool_use_id: Optional[str], context: Any) -> dict[str, Any]:
         tool_name = input_data.get("tool_name", "")
@@ -50,9 +58,18 @@ def pre_tool_use_hook(governor: ToolGovernor):
             context={"claude_session_id": input_data.get("session_id")},
             mcp_server=mcp_server,
             tier_aliases=(tool_name,) if mcp_server else (),
+            approval_handler=deferral,
         )
         if result.allowed:
             return {}
+        if result.deferred:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": "Marshal policy requires approval for this tool call",
+                }
+            }
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -64,8 +81,40 @@ def pre_tool_use_hook(governor: ToolGovernor):
     return hook
 
 
-def marshal_hooks(governor: ToolGovernor, matcher: Optional[str] = None) -> dict[str, list[HookMatcher]]:
+def post_tool_use_hook(governor: ToolGovernor):
+    """Reports outcomes (`PostToolUse` = success, `PostToolUseFailure` =
+    failure, with the SDK's own `duration_ms`) for reliability policies.
+    The failure's error text is never recorded — it can echo tool input —
+    only "interrupted" or "tool_error"."""
+
+    async def hook(input_data: Any, tool_use_id: Optional[str], context: Any) -> dict[str, Any]:
+        tool_name = input_data.get("tool_name", "")
+        mcp_server, name = _split_mcp_name(tool_name)
+        failed = input_data.get("hook_event_name") == "PostToolUseFailure"
+        error = None
+        if failed:
+            error = "interrupted" if input_data.get("is_interrupt") else "tool_error"
+        governor.record_outcome(
+            name, input_data.get("tool_input", {}), not failed, input_data.get("duration_ms"), error,
+            mcp_server=mcp_server, tier_aliases=(tool_name,) if mcp_server else (),
+        )
+        return {}
+
+    return hook
+
+
+def marshal_hooks(
+    governor: ToolGovernor, matcher: Optional[str] = None, ask_for_approval: bool = False
+) -> dict[str, list[HookMatcher]]:
     """A ready-made `hooks=` value for `ClaudeAgentOptions`. `matcher`
     narrows which tools are governed (the SDK's own matcher syntax);
-    the default, None, governs every tool."""
-    return {"PreToolUse": [HookMatcher(matcher=matcher, hooks=[pre_tool_use_hook(governor)], on_failure="block")]}
+    the default, None, governs every tool. Includes the outcome hooks
+    (`PostToolUse`/`PostToolUseFailure`), which never block anything."""
+    post = post_tool_use_hook(governor)
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher=matcher, hooks=[pre_tool_use_hook(governor, ask_for_approval)], on_failure="block")
+        ],
+        "PostToolUse": [HookMatcher(matcher=matcher, hooks=[post])],
+        "PostToolUseFailure": [HookMatcher(matcher=matcher, hooks=[post])],
+    }
