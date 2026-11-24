@@ -514,6 +514,38 @@ Run `python examples/operations_example.py` for a full shift: an outage,
 the health report, a CLI quarantine, blast radius and unit cost, and a
 red-team gate that catches a missing rate limit.
 
+## Quickstart: alerts and output quality
+
+```python
+from marshal_ai import AlertManager, WebhookNotifier, agent_run, alerts_from, evaluate
+
+with agent_run(sink, task="draft-reply"):
+    draft = agent.run(ticket)
+    evaluate(sink, {"grounded": your_grounding_check}, draft, context={"sources": docs})  # verdicts only, never the draft
+
+manager = AlertManager("alerts.db", notifiers=[WebhookNotifier(url, secret=key_from_your_vault)], audit_sink=sink)
+manager.process(alerts_from(sink))   # call on a schedule; deduplicated, retried, dead-lettered
+```
+
+```bash
+python -m marshal_ai.cli alerts list alerts.db
+python -m marshal_ai.cli alerts ack alerts.db health:task:draft-reply --as oncall@co --reason "rolling back" --audit audit.db
+```
+
+- Scorers are yours: a bool, a number in [0, 1], or `Score(passed,
+  score)`. A scorer that crashes counts as a failed check. `assess`
+  reports each task type's health from them; `run_costs` adds cost per
+  *passing* run.
+- An alert notifies once, reminds after `renotify_seconds` unless
+  acknowledged, re-notifies if it gets worse even when acknowledged, and
+  notifies when it resolves. Delivery is at-least-once through a SQLite
+  outbox; every notice has a stable `delivery_id`.
+- `WebhookNotifier` refuses redirects and credentials in the URL, needs
+  https, and signs each body (`verify_webhook_signature` on the
+  receiving side).
+
+Run `python examples/alerts_and_evals_example.py`.
+
 ## Quickstart: when tools break
 
 ```python

@@ -83,6 +83,18 @@ from marshal_ai.quarantine import Quarantine, QuarantineEntry, QuarantineModelPo
 from marshal_ai.health import HealthReport, HealthThresholds, HeartbeatEntry, assess, record_heartbeat, render_health_markdown
 from marshal_ai.redteam import RedTeamReport, RedTeamTargets, render_redteam_markdown, run_redteam
 from marshal_ai.inventory import build_inventory, render_mermaid, run_costs
+from marshal_ai.evals import EvaluationEntry, Score, evaluate, record_evaluation
+from marshal_ai.alerts import (
+    Alert,
+    AlertEntry,
+    AlertManager,
+    AlertNotice,
+    CallableNotifier,
+    WebhookNotifier,
+    alerts_from,
+    slack_payload,
+    verify_webhook_signature,
+)
 from marshal_ai.incidents import (
     IncidentEntry,
     IncidentReport,
@@ -113,7 +125,7 @@ from marshal_ai.reports import (
 # used for `marshal_ai.otel` and `marshal_ai.integrations`: optional-
 # backend code stays out of the core namespace, reached one import away.
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 __all__ = [
     "AuditableEvent",
@@ -222,6 +234,19 @@ __all__ = [
     "build_inventory",
     "render_mermaid",
     "run_costs",
+    "EvaluationEntry",
+    "Score",
+    "evaluate",
+    "record_evaluation",
+    "Alert",
+    "AlertEntry",
+    "AlertManager",
+    "AlertNotice",
+    "CallableNotifier",
+    "WebhookNotifier",
+    "alerts_from",
+    "slack_payload",
+    "verify_webhook_signature",
     "IncidentEntry",
     "IncidentReport",
     "IncidentSignal",

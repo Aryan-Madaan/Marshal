@@ -1274,3 +1274,26 @@ scenario.
   "Interface Segregation" above.
 - **`tools.py`/`models.py` bundle policy + guard + entry type in one
   file each** — see "Single Responsibility" above.
+
+## Alerts and evaluations (v0.17)
+
+- **Outbox before send.** A notification is a database row before it is
+  a network call. Sending first and recording after loses alerts on a
+  crash; recording first and leasing gives at-least-once with a stable
+  `delivery_id` for receivers to dedupe. Exactly-once isn't offered
+  because no webhook receiver can make it true.
+- **Acknowledgement is scoped to severity.** Escalation clears an ack.
+  An ack on a warning silencing the critical that follows is the failure
+  that makes on-call stop trusting alerts.
+- **Error types, not messages, are stored** for failed deliveries: an
+  exception message from an HTTP client often contains the URL, and
+  webhook URLs often contain tokens.
+- **Redirects are refused** by the webhook notifier: following one lets
+  the receiving host point Marshal anywhere, including cloud metadata
+  endpoints.
+- **Marshal ships no scorers.** Quality checks are domain-specific and,
+  when model-based, steerable by the content they judge. Evaluations are
+  for people deciding whether an agent works — never an input to an
+  authorization decision. A crashing scorer is recorded as a failure,
+  because a missing quality signal reads as "fine".
+

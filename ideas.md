@@ -657,6 +657,21 @@ project" question from the original writeup below is resolved: one library.
 Shared audit infrastructure across surfaces turned out to matter more than
 keeping each surface's scope maximally narrow.
 
+- **v0.17 — alerts and output quality.** `AlertManager` turns computed
+  health and triage signals into notifications with real delivery
+  semantics: deduplicated by key, reminders on a timer, acknowledgement
+  (cleared when the alert gets worse), resolution notices, and an SQLite
+  outbox with leases, exponential backoff and dead letters, so delivery
+  is at-least-once and a crash mid-send re-sends rather than drops.
+  `WebhookNotifier` signs bodies and refuses redirects and URL
+  credentials. `marshal_ai.evals` is the plug-in point for quality
+  scorers: verdicts land in the trail, tied to the run, and feed task
+  health and cost per *passing* run. **Found along the way**:
+  `dependents_of("mcp:...")` returned tool names, not agents (now
+  transitive); Mermaid node ids could collide (`a-b` / `a_b`); CLI
+  quarantine and acknowledgements never reached the audit trail (now
+  `--audit`).
+
 ## Backlog — not started yet
 
 - **Time-to-first-token tracking for streaming calls.** v0.8's reliability
@@ -698,16 +713,6 @@ keeping each surface's scope maximally narrow.
 
 - **CrewAI as an extra**, once a CrewAI release allows `mcp>=2.3` and
   `openai>=3`.
-
-- **Alert delivery.** `assess` and `incident_candidates` compute what's
-  wrong. Routing that to people (webhook/Slack/email, deduplication,
-  acknowledgement) is the natural next step, but needs a delivery
-  guarantee design, not just an HTTP POST.
-
-- **Continuous evaluation hooks.** A place to attach output-quality
-  scorers (groundedness, task completion) whose results land in the same
-  trail and feed `assess`. Scorers are model-based, so this would be a
-  plug-in point, never a default.
 
 Add more here as they come up — pain points from real work beat cold-cloned ideas.
 

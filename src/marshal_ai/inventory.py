@@ -24,6 +24,7 @@ worth what it costs — falls out directly.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -57,8 +58,22 @@ class Inventory:
 
     def dependents_of(self, node: str) -> list[str]:
         """Agents that depend on `node` (e.g. "tool:wire_transfer",
-        "mcp:billing", "model:gpt-5") — the blast radius of quarantining it."""
-        return sorted({e.source.split(":", 1)[1] for e in self.edges if e.target == node})
+        "mcp:billing", "model:gpt-5") — the blast radius of quarantining it.
+        Followed transitively: an MCP server's dependents are the agents
+        calling any tool served through it."""
+        agents: set[str] = set()
+        seen, frontier = {node}, [node]
+        while frontier:
+            target = frontier.pop()
+            for e in self.edges:
+                if e.target != target or e.relation == "acts_for" or e.source in seen:
+                    continue
+                seen.add(e.source)
+                if e.source.startswith("agent:"):
+                    agents.add(e.source.split(":", 1)[1])
+                else:
+                    frontier.append(e.source)
+        return sorted(agents)
 
     def to_dict(self) -> dict[str, Any]:
         return {**{k: v for k, v in asdict(self).items() if k != "edges"}, "edges": [e.to_dict() for e in self.edges]}
@@ -98,7 +113,9 @@ def build_inventory(sink: AuditSink, since: Optional[float] = None) -> Inventory
 
 
 def _node_id(node: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_]", "_", node)
+    # The digest keeps ids unique: "tool:a-b" and "tool:a_b" would otherwise
+    # both become tool_a_b and merge into one node.
+    return re.sub(r"[^A-Za-z0-9_]", "_", node) + "_" + hashlib.sha256(node.encode("utf-8")).hexdigest()[:8]
 
 
 def render_mermaid(inventory: Inventory) -> str:
@@ -127,6 +144,7 @@ class RunCost:
     completion_tokens: int
     cost_usd: float
     unpriced_models: list[str]
+    evaluation_passed: Optional[bool] = None  # None when the run has no evaluations
 
 
 @dataclass(frozen=True)
@@ -137,6 +155,9 @@ class TaskCost:
     success_rate: Optional[float]
     total_cost_usd: float
     cost_per_successful_run_usd: Optional[float]
+    evaluated_runs: int = 0  # completed runs with at least one evaluation
+    passing_runs: int = 0  # ... of which every evaluation passed
+    cost_per_passing_run_usd: Optional[float] = None  # None until some run is evaluated
 
 
 @dataclass(frozen=True)
@@ -154,9 +175,15 @@ def run_costs(sink: AuditSink, pricing: dict[str, tuple[float, float]]) -> RunCo
     1K prompt tokens, USD per 1K completion tokens). Usage on a model with
     no price counts toward tokens but not cost, and is listed per run.
     A sub-run's spend is attributed to its own run, and its parent's task
-    via `parent_run_id` isn't double-counted."""
+    via `parent_run_id` isn't double-counted.
+
+    With evaluations (`marshal_ai.evals`) in the trail, a run *passes*
+    when it completed and every evaluation recorded in it passed, and
+    `cost_per_passing_run_usd` divides the task's whole spend (failed and
+    unevaluated runs included — they cost money too) by passing runs."""
     meta: dict[str, dict[str, Any]] = {}
     usage: dict[Optional[str], list[Any]] = defaultdict(list)
+    verdicts: dict[str, list[bool]] = defaultdict(list)
     for entry in sink.all_entries():
         data = entry.to_dict()
         if data["kind"] == "agent_run":
@@ -166,6 +193,8 @@ def run_costs(sink: AuditSink, pricing: dict[str, tuple[float, float]]) -> RunCo
                 m["status"] = data.get("status")
         elif data["kind"] == "model_usage":
             usage[data.get("run_id")].append(data)
+        elif data["kind"] == "evaluation" and data.get("run_id"):
+            verdicts[data["run_id"]].append(bool(data["passed"]))
 
     def price(rows: list[dict[str, Any]]) -> tuple[int, int, float, list[str]]:
         p = c = 0
@@ -184,7 +213,9 @@ def run_costs(sink: AuditSink, pricing: dict[str, tuple[float, float]]) -> RunCo
     runs = []
     for run_id, m in meta.items():
         p, c, cost, unpriced = price(usage.get(run_id, []))
-        runs.append(RunCost(run_id, m["task"], m["status"], p, c, round(cost, 6), unpriced))
+        checks = verdicts.get(run_id)
+        runs.append(RunCost(run_id, m["task"], m["status"], p, c, round(cost, 6), unpriced,
+                            all(checks) if checks else None))
 
     tasks: dict[str, list[RunCost]] = defaultdict(list)
     for run in runs:
@@ -194,11 +225,15 @@ def run_costs(sink: AuditSink, pricing: dict[str, tuple[float, float]]) -> RunCo
         total = sum(r.cost_usd for r in items)
         ok = sum(1 for r in items if r.status == "completed")
         finished = sum(1 for r in items if r.status is not None)
+        evaluated = [r for r in items if r.status == "completed" and r.evaluation_passed is not None]
+        passing = sum(1 for r in evaluated if r.evaluation_passed)
         by_task.append(TaskCost(
             task=task, runs=len(items), successful_runs=ok,
             success_rate=ok / finished if finished else None,
             total_cost_usd=round(total, 6),
             cost_per_successful_run_usd=round(total / ok, 6) if ok else None,
+            evaluated_runs=len(evaluated), passing_runs=passing,
+            cost_per_passing_run_usd=round(total / passing, 6) if passing else None,
         ))
     _, _, loose, _ = price(usage.get(None, []))
     return RunCostReport(sorted(runs, key=lambda r: r.run_id), by_task, round(loose, 6))

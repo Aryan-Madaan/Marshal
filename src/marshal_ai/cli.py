@@ -15,6 +15,8 @@ Usage:
     python -m marshal_ai.cli approvals decline approvals.db apr-1234 --as maria@company --note "not eligible"
     python -m marshal_ai.cli quarantine add quarantine.db tool wire_transfer --as oncall@company --reason "INC-42"
     python -m marshal_ai.cli quarantine list quarantine.db
+    python -m marshal_ai.cli alerts list alerts.db
+    python -m marshal_ai.cli alerts ack alerts.db health:tool:wire_transfer --as oncall@company --reason "on it"
     python -m marshal_ai.cli health audit.db --window 900
     python -m marshal_ai.cli inventory audit.jsonl            # Mermaid graph
     python -m marshal_ai.cli redteam policies.yaml --send-external send_email --destructive delete_account
@@ -160,7 +162,7 @@ def _open_sink(path: str):
 def cmd_quarantine(args: argparse.Namespace) -> None:
     from marshal_ai.quarantine import Quarantine
 
-    q = Quarantine(args.path)
+    q = Quarantine(args.path, audit_sink=_open_sink(args.audit) if args.audit else None)
     try:
         if args.action == "list":
             records = q.active()
@@ -182,6 +184,37 @@ def cmd_quarantine(args: argparse.Namespace) -> None:
         print(_terminal_safe(f"{args.action}: {args.kind} {args.name}"))
     finally:
         q.close()
+
+
+def cmd_alerts(args: argparse.Namespace) -> None:
+    from marshal_ai.alerts import AlertManager
+
+    manager = AlertManager(args.path, audit_sink=_open_sink(args.audit) if args.audit else None)
+    try:
+        if args.action == "ack":
+            if not (args.key and args.by and args.reason):
+                raise SystemExit("ack needs: <key> --as <you> --reason <why>")
+            try:
+                manager.acknowledge(args.key, by=args.by, reason=args.reason)
+            except (KeyError, ValueError) as exc:
+                raise SystemExit(_terminal_safe(str(exc)))
+            print(_terminal_safe(f"acknowledged: {args.key}"))
+        elif args.action == "dead":
+            rows = manager.dead_letters()
+            if not rows:
+                print("no dead letters")
+            for r in rows:
+                print(_terminal_safe(f"{r['delivery_id']}  {r['notifier']}  {r['key']}  "
+                                     f"{r['attempts']} attempts, last error {r['last_error']}"))
+        else:
+            records = manager.alerts(include_resolved=args.all)
+            if not records:
+                print("no open alerts")
+            for r in records:
+                ack = f"  (acked by {r.acknowledged_by}: {r.acknowledged_reason})" if r.acknowledged_by else ""
+                print(_terminal_safe(f"{r.state:<12} {r.severity:<8} {r.key}  — {r.title}{ack}"))
+    finally:
+        manager.close()
 
 
 def cmd_health(args: argparse.Namespace) -> None:
@@ -249,7 +282,18 @@ def build_parser() -> argparse.ArgumentParser:
     q_parser.add_argument("name", nargs="?")
     q_parser.add_argument("--as", dest="by", help="Who is acting (recorded)")
     q_parser.add_argument("--reason", help="Why (recorded)")
+    q_parser.add_argument("--audit", help="Also write the action to this audit trail (.jsonl or .db)")
     q_parser.set_defaults(func=cmd_quarantine)
+
+    a_parser = subparsers.add_parser("alerts", help="List, acknowledge, or inspect undeliverable alerts")
+    a_parser.add_argument("action", choices=["list", "ack", "dead"])
+    a_parser.add_argument("path", help="Path to the AlertManager database")
+    a_parser.add_argument("key", nargs="?", help="Alert key (ack)")
+    a_parser.add_argument("--as", dest="by", help="Who is acknowledging (recorded)")
+    a_parser.add_argument("--reason", help="Why (recorded)")
+    a_parser.add_argument("--all", action="store_true", help="Include resolved alerts in list")
+    a_parser.add_argument("--audit", help="Also write the acknowledgement to this audit trail (.jsonl or .db)")
+    a_parser.set_defaults(func=cmd_alerts)
 
     h_parser = subparsers.add_parser("health", help="Operational health from an audit trail")
     h_parser.add_argument("path")

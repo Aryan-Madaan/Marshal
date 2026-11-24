@@ -1,6 +1,6 @@
 [project]
 name = "marshal-ai"
-version = "0.16.0"
+version = "0.17.0"
 description = "Governance for AI agents: permission-aware retrieval with delegation (agent acting for a user), tool-call approval and lethal-trifecta flow control across retrieval and tools, egress allowlisting, MCP tool-call governance with tool-definition pinning, model routing/budgets/data-residency/reliability with provider-hosted-tool control, native hooks for LangChain, the Claude Agent SDK, Google ADK, the OpenAI Agents SDK and LiteLLM, and a durable, tamper-evident audit trail with EU AI Act-shaped compliance and Article 73 incident reports — one library, one place to see what happened."
 readme = "README.md"
 license = { file = "LICENSE" }

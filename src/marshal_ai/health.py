@@ -19,6 +19,12 @@ happened in the trailing window:
 | `unknown` | heartbeats were expected and stopped arriving — telemetry loss, or the agent died |
 | `not_instrumented` | decisions are recorded but no outcomes ever are, so health can't be judged |
 
+Task types (`subject_kind="task"`) are judged from output-quality
+evaluations (`marshal_ai.evals`): the share of failed checks in the
+window against `warn_eval_failure_rate` / `fail_eval_failure_rate`. A
+task with runs but no evaluations simply doesn't appear — quality isn't
+something Marshal can infer from governance data alone.
+
 Outcomes come from `ToolOutcomeEntry` (`ToolGuard(..., audit_outcomes=True)`,
 the MCP session, framework hooks) and `ModelOutcomeEntry`
 (`marshal_ai.integrations`). Denials are counted separately from
@@ -34,7 +40,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Optional
 
 from marshal_ai._runctx import current_parent_run_id, current_run_id
@@ -74,11 +80,13 @@ class HealthThresholds:
     warn_p95_latency_ms: Optional[float] = None
     warn_denial_rate: float = 0.50  # agents only
     heartbeat_stale_seconds: float = 900.0
+    warn_eval_failure_rate: float = 0.10  # tasks only
+    fail_eval_failure_rate: float = 0.30  # tasks only
 
 
 @dataclass(frozen=True)
 class HealthReport:
-    subject_kind: str  # "tool" | "model" | "agent"
+    subject_kind: str  # "tool" | "model" | "agent" | "task"
     subject: str
     status: str
     reasons: list[str]
@@ -128,6 +136,8 @@ def assess(
     now = now if now is not None else time.time()
     since = now - window_seconds
     subjects: dict[tuple[str, str], _Acc] = {}
+    run_task: dict[str, str] = {}
+    evaluations: list[tuple[float, dict[str, Any]]] = []
 
     def acc(kind: str, name: str) -> _Acc:
         return subjects.setdefault((kind, name), _Acc())
@@ -136,6 +146,13 @@ def assess(
         data = entry.to_dict()
         kind, ts, agent = data["kind"], entry.timestamp, entry.principal_id
         in_window = ts >= since
+        if kind == "agent_run":
+            if data.get("task") and data.get("run_id"):
+                run_task.setdefault(data["run_id"], data["task"])
+            continue
+        if kind == "evaluation":
+            evaluations.append((ts, data))
+            continue
         if kind == "heartbeat":
             acc("agent", agent).heartbeats.append((ts, data.get("ok", True)))
             acc("agent", agent).seen(ts)
@@ -158,12 +175,22 @@ def assess(
                     target.denials += int(denied)
                     target.trips += int(any(m in data.get("reason", "") for m in _TRIP_MARKERS))
 
+    for ts, data in evaluations:  # after the loop: a run's task is known once its start marker is seen
+        task = data.get("task") or run_task.get(data.get("run_id") or "") or "(untasked)"
+        target = acc("task", task)
+        target.ever_had_outcomes = True
+        target.seen(ts)
+        if ts >= since:
+            target.outcomes.append((bool(data["passed"]), None))
+
     reports = [_judge(kind, name, a, now, thresholds) for (kind, name), a in subjects.items()]
     severity = {"failing": 0, "unknown": 1, "degraded": 2, "not_instrumented": 3, "idle": 4, "healthy": 5}
     return sorted(reports, key=lambda r: (severity[r.status], r.subject_kind, r.subject))
 
 
 def _judge(kind: str, name: str, a: _Acc, now: float, t: HealthThresholds) -> HealthReport:
+    if kind == "task":
+        t = replace(t, warn_error_rate=t.warn_eval_failure_rate, fail_error_rate=t.fail_eval_failure_rate)
     calls = len(a.outcomes)
     failures = sum(1 for ok, _ in a.outcomes if not ok)
     rate = failures / calls if calls else None
@@ -184,7 +211,10 @@ def _judge(kind: str, name: str, a: _Acc, now: float, t: HealthThresholds) -> He
         status = "failing"
         reasons.append(f"{a.trips} call(s) refused by a tripped breaker in the window")
     elif calls == 0:
-        if a.decisions and not a.ever_had_outcomes:
+        if kind == "task":
+            status = "idle"
+            reasons.append("no evaluations in the window")
+        elif a.decisions and not a.ever_had_outcomes:
             status = "not_instrumented"
             reasons.append("decisions recorded but no outcomes — enable audit_outcomes / outcome reporting")
         else:
@@ -195,10 +225,10 @@ def _judge(kind: str, name: str, a: _Acc, now: float, t: HealthThresholds) -> He
             reasons.append(f"only {calls} call(s) in the window — low confidence")
         if rate is not None and rate >= t.fail_error_rate and calls >= t.min_samples:
             status = "failing"
-            reasons.append(f"error rate {rate:.0%} ≥ {t.fail_error_rate:.0%}")
+            reasons.append(f"{_rate_label(kind)} {rate:.0%} ≥ {t.fail_error_rate:.0%}")
         elif rate is not None and rate >= t.warn_error_rate and calls >= t.min_samples:
             status = "degraded"
-            reasons.append(f"error rate {rate:.0%} ≥ {t.warn_error_rate:.0%}")
+            reasons.append(f"{_rate_label(kind)} {rate:.0%} ≥ {t.warn_error_rate:.0%}")
         if t.warn_p95_latency_ms is not None and p95 is not None and p95 > t.warn_p95_latency_ms and status == "healthy":
             status = "degraded"
             reasons.append(f"p95 latency {p95:.0f} ms > {t.warn_p95_latency_ms:.0f} ms")
@@ -213,6 +243,10 @@ def _judge(kind: str, name: str, a: _Acc, now: float, t: HealthThresholds) -> He
         subject_kind=kind, subject=name, status=status, reasons=reasons, calls=calls, failures=failures,
         error_rate=rate, p95_latency_ms=p95, denials=a.denials, last_seen=a.last_seen,
     )
+
+
+def _rate_label(kind: str) -> str:
+    return "failed-evaluation rate" if kind == "task" else "error rate"
 
 
 def render_health_markdown(reports: list[HealthReport]) -> str:
